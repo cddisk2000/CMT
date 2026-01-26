@@ -132,6 +132,25 @@ def parse_memory_used_percent(output: str):
         return None
     return round(used / total * 100.0, 2)
 
+def parse_ntp_sync(output: str):
+    out = (output or "").lower()
+    if "unsynchronized" in out:
+        return False
+    if "synchronized" in out:
+        return True
+    return None
+
+def parse_env_alerts(output: str) -> int:
+    """
+    Best-effort count of environment alarms from 'show environment all'
+    """
+    out = output or ""
+    count = 0
+    for line in out.splitlines():
+        if re.search(r"\b(fail|fault|critical|shutdown)\b", line, flags=re.I):
+            count += 1
+    return count
+
 def parse_int_error_summary(output: str) -> dict:
     out = output or ""
     lines = [l.rstrip() for l in out.splitlines() if l.strip()]
@@ -366,7 +385,7 @@ def parse_trunk_ports(output: str) -> pd.DataFrame:
 # =========================================================
 # Health rules (add VLAN/SVI checks)
 # =========================================================
-def decide_status(cpu5, mem_pct, err_crc, trans_crit, vlan1_exists, vlan1_svi_has_ip, svi_down_cnt) -> tuple[str, int, int]:
+def decide_status(cpu5, mem_pct, err_crc, trans_crit, vlan1_exists, vlan1_svi_has_ip, svi_down_cnt, env_alerts, ntp_sync) -> tuple[str, int, int]:
     critical = 0
     warning = 0
 
@@ -400,6 +419,14 @@ def decide_status(cpu5, mem_pct, err_crc, trans_crit, vlan1_exists, vlan1_svi_ha
     if vlan1_exists and (not vlan1_svi_has_ip):
         critical += 1
     if svi_down_cnt >= 1:
+        warning += 1
+
+    # Environment
+    if env_alerts >= 1:
+        critical += 1
+
+    # NTP
+    if ntp_sync is False:
         warning += 1
 
     if critical > 0:
@@ -443,12 +470,18 @@ def get_device(base_device: dict) -> tuple[dict, dict]:
         "XCVR MinRx(dBm)": None,
         "XCVR MaxTemp(C)": None,
 
+        # Environment/NTP
+        "Env Alerts": 0,
+        "NTP Sync": "Unknown",
+
         # B VLAN/SVI summary
         "VLAN1 Exists": False,
         "VLAN1 SVI IP": "N/A",
         "SVI Down Count": 0,
         "Trunk Count": 0,
 
+        "Health Score": 0,
+        "Issues": "",
         "Status": "N/A",
         "Critical": 0,
         "Warning": 0,
@@ -471,6 +504,10 @@ def get_device(base_device: dict) -> tuple[dict, dict]:
 
         # --- A Optical ---
         xcvr_out = safe_send(conn, "show interfaces transceiver")
+
+        # --- Env/NTP ---
+        env_out = safe_send(conn, "show environment all")
+        ntp_out = safe_send(conn, "show ntp status")
 
         # --- B VLAN/SVI ---
         vlan_out = safe_send(conn, "show vlan brief")
@@ -511,6 +548,18 @@ def get_device(base_device: dict) -> tuple[dict, dict]:
                 overview["XCVR MaxTemp(C)"] = float(df_xcvr["Temp(C)"].max())
         details["tables"]["optical"] = df_xcvr
 
+        # --- Env/NTP summary ---
+        env_alerts = parse_env_alerts(env_out)
+        overview["Env Alerts"] = int(env_alerts)
+
+        ntp_sync = parse_ntp_sync(ntp_out)
+        if ntp_sync is True:
+            overview["NTP Sync"] = "Yes"
+        elif ntp_sync is False:
+            overview["NTP Sync"] = "No"
+        else:
+            overview["NTP Sync"] = "Unknown"
+
         # --- B VLAN / SVI / Trunk tables + summary ---
         df_vlan = parse_vlan_brief(vlan_out)
         details["tables"]["vlan"] = df_vlan
@@ -548,16 +597,42 @@ def get_device(base_device: dict) -> tuple[dict, dict]:
             vlan1_exists=overview["VLAN1 Exists"],
             vlan1_svi_has_ip=vlan1_has_ip,
             svi_down_cnt=overview["SVI Down Count"],
+            env_alerts=overview["Env Alerts"],
+            ntp_sync=ntp_sync,
         )
         overview["Status"] = status
         overview["Critical"] = c
         overview["Warning"] = w
+        overview["Health Score"] = max(0, 100 - (c * 30) - (w * 10))
+
+        issues = []
+        if overview["CPU5%"] is not None and overview["CPU5%"] >= 80:
+            issues.append("High CPU")
+        if overview["MemUsed%"] is not None and overview["MemUsed%"] >= 85:
+            issues.append("High Memory")
+        if overview["CRC Sum"] >= 200:
+            issues.append("CRC Errors")
+        if overview["XCVR CritPorts"] >= 1:
+            issues.append("XCVR Critical")
+        if overview["Env Alerts"] >= 1:
+            issues.append("Env Alert")
+        if overview["NTP Sync"] == "No":
+            issues.append("NTP Unsync")
+        if not overview["VLAN1 Exists"]:
+            issues.append("VLAN1 Missing")
+        if overview["VLAN1 Exists"] and (not vlan1_has_ip):
+            issues.append("VLAN1 IP Missing")
+        if overview["SVI Down Count"] >= 1:
+            issues.append("SVI Down")
+        overview["Issues"] = "; ".join(issues)
 
         # raw (for troubleshooting)
         details["raw"]["cpu"] = cpu_out
         details["raw"]["memory"] = mem_out
         details["raw"]["errors"] = err_out
         details["raw"]["transceiver"] = xcvr_out
+        details["raw"]["environment"] = env_out
+        details["raw"]["ntp"] = ntp_out
         details["raw"]["vlan"] = vlan_out
         details["raw"]["ip_int_brief"] = ipif_out
         details["raw"]["trunk"] = trunk_out
@@ -695,6 +770,26 @@ def run():
     c2.metric("WARNING", warn_cnt)
     c3.metric("CRITICAL", crit_cnt)
 
+    if "Health Score" in df_over.columns:
+        c1, c2 = st.columns(2)
+        avg_score = int(df_over["Health Score"].mean()) if not df_over.empty else 0
+        c1.metric("Avg Health Score", avg_score)
+        c2.metric("Devices", int(len(df_over)))
+
+    st.subheader("Anomaly Top N")
+    if "Status" in df_over.columns:
+        top_n = df_over[df_over["Status"].isin(["CRITICAL", "WARNING"])].copy()
+        if top_n.empty:
+            st.info("No anomalies detected.")
+        else:
+            top_n = top_n.sort_values(
+                by=["Critical", "Warning", "Health Score", "IP"],
+                ascending=[False, False, True, True],
+                kind="stable",
+            )
+            cols = [c for c in ["IP", "Hostname", "Status", "Health Score", "Issues", "Critical", "Warning"] if c in top_n.columns]
+            st.dataframe(top_n.head(5)[cols], use_container_width=True)
+
     st.subheader("Results (Overview)")
     if "Status" in df_over.columns:
         st.dataframe(df_over.style.applymap(style_status, subset=["Status"]), use_container_width=True)
@@ -717,6 +812,7 @@ def run():
         "Memory",
         "Interface Errors",
         "Trunk",
+        "Environment/NTP",
         "Raw / Error"
     ])
 
@@ -791,6 +887,11 @@ def run():
             st.code((d.get("raw", {}) or {}).get("trunk", ""), language="text")
 
     with tabs[7]:
+        st.markdown("### Environment / NTP")
+        st.code((d.get("raw", {}) or {}).get("environment", ""), language="text")
+        st.code((d.get("raw", {}) or {}).get("ntp", ""), language="text")
+
+    with tabs[8]:
         st.markdown("### Raw / Error")
         if d.get("error"):
             st.error(d["error"])
