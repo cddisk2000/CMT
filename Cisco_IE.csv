@@ -1,0 +1,3 @@
+﻿ip,interface
+10.10.15.23,GigabitEthernet1/0/28
+10.10.15.2,GigabitEthernet1/0/28
