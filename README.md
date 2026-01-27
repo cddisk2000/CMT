@@ -5,6 +5,7 @@
 - Python Dependencies: pip3 install streamlit pandas netmiko paramiko graphviz
 - How To Run
 <br> nohup streamlit run cmt.py --server.address 0.0.0.0 --server.port 8500 > streamlit.log 2>&1 & <br>
+<br> http://IP:8500 <br>
 - Check execution program
 <br> ps -ef | grep streamlit | grep -v grep <br>
 
