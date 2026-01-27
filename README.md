@@ -1,4 +1,3 @@
-<img width="1260" height="582" alt="image" src="https://github.com/user-attachments/assets/49ae3015-612f-4819-b6c8-1261bfd2fb41" />- Authors: ChatGPT, Gemini, Lingma
 - System Environment: Oracle Linux R8.X
 - System Dependencies: yum install gcc openssl-devel bzip2-devel libffi-devel zlib-devel graphviz -y
 - Python: 3.11
