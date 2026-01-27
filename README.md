@@ -1,9 +1,15 @@
-- Authors: ChatGPT, Gemini, Lingma
+<img width="1260" height="582" alt="image" src="https://github.com/user-attachments/assets/49ae3015-612f-4819-b6c8-1261bfd2fb41" />- Authors: ChatGPT, Gemini, Lingma
 - System Environment: Oracle Linux R8.X
 - System Dependencies: yum install gcc openssl-devel bzip2-devel libffi-devel zlib-devel graphviz -y
 - Python: 3.11
 - Python Dependencies: pip3 install streamlit pandas netmiko paramiko graphviz
 
-<img width="1802" height="789" alt="image" src="https://github.com/user-attachments/assets/8d4b3cab-4052-4e63-b6d3-6015a7210598" />
+- IE Optical Fiber Health 
+<img width="1261" height="552" alt="image" src="https://github.com/user-attachments/assets/88e30307-7ab3-433d-b40e-9e5563a90ba6" />
+
+- Cisco General
+<img width="1260" height="582" alt="image" src="https://github.com/user-attachments/assets/83e543af-6837-4f0f-9fd4-10953e1d4294" />
+
+
 
 
