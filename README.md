@@ -10,14 +10,21 @@
 <br> ps -ef | grep streamlit | grep -v grep <br>
 
 #=== IE Optical Fiber Health ====
-<img width="1261" height="552" alt="image" src="https://github.com/user-attachments/assets/88e30307-7ab3-433d-b40e-9e5563a90ba6" />
+<img width="976" height="527" alt="image" src="https://github.com/user-attachments/assets/3571a127-f98c-4bf7-8f81-f8cdb50aea6e" />
 
 #=== Cisco General ====
-<img width="1260" height="582" alt="image" src="https://github.com/user-attachments/assets/d9d62116-eb6e-48dd-8161-b5589671f3a0" />
+<img width="961" height="532" alt="image" src="https://github.com/user-attachments/assets/36671007-9492-4f14-8221-160a6d7c8269" />
+
+#=== Network Architecture Diagram ===
+<img width="728" height="415" alt="image" src="https://github.com/user-attachments/assets/a2aefb5c-f065-4bd9-8999-885e244dfa7c" />
 
 #=== Version Update ==
 <br> Added Network Architecture Diagram (Alerts, Ping) <br>
 <br> Optimize button interface <br>
+
+
+
+Most good programmers do programming not because they expect pay or public praise, but because programming is fun
 
 
 
