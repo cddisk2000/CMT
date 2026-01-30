@@ -1,0 +1,551 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Zabbix Map Component</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", Arial, sans-serif;
+        background: transparent;
+        color: #fef3c7;
+      }
+      #wrapper {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      #palette {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        padding: 6px 4px;
+      }
+      .palette-item {
+        padding: 6px 10px;
+        background: linear-gradient(135deg, rgba(120, 53, 15, 0.6), rgba(30, 41, 59, 0.7));
+        border: 1px solid rgba(251, 146, 60, 0.5);
+        border-radius: 10px;
+        color: #fde68a;
+        font-size: 12px;
+        cursor: grab;
+        user-select: none;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      .palette-item:active {
+        cursor: grabbing;
+      }
+      #hint {
+        font-size: 11px;
+        color: #fcd34d;
+        padding-left: 4px;
+      }
+      #canvas {
+        border: 1px solid rgba(251, 146, 60, 0.35);
+        border-radius: 14px;
+        background: radial-gradient(circle at top left, rgba(120, 53, 15, 0.22), transparent 60%),
+          radial-gradient(circle at bottom right, rgba(249, 115, 22, 0.18), transparent 55%),
+          rgba(2, 6, 23, 0.45);
+        overflow: hidden;
+        position: relative;
+      }
+      svg {
+        display: block;
+      }
+      .edge {
+        stroke: rgba(251, 146, 60, 0.55);
+        stroke-width: 2.4;
+        fill: none;
+      }
+      .group-rect {
+        fill: rgba(251, 146, 60, 0.08);
+        stroke: rgba(251, 146, 60, 0.4);
+        stroke-width: 1;
+        rx: 12;
+      }
+      .group-label {
+        font-size: 11px;
+        fill: #fde68a;
+      }
+      .node-label {
+        fill: #fef3c7;
+        font-size: 12px;
+        text-anchor: start;
+        dominant-baseline: middle;
+        pointer-events: none;
+        font-weight: 600;
+        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+      }
+      .node-label .title-line {
+        font-size: 13px;
+        font-weight: 700;
+        fill: #fff7ed;
+      }
+      .node-label .status-line {
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+      }
+      .node-label .status-up {
+        fill: #22c55e;
+      }
+      .node-label .status-degraded {
+        fill: #f59e0b;
+      }
+      .node-label .status-down {
+        fill: #ef4444;
+      }
+      .node-label .status-unknown {
+        fill: #94a3b8;
+      }
+      .node-label .avg-line {
+        font-size: 9px;
+        fill: #cbd5f5;
+        font-weight: 500;
+        letter-spacing: 0.01em;
+      }
+      .node-label .ip-line {
+        font-size: 11px;
+        fill: #bae6fd;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+      }
+      .node-icon {
+        font-size: 10px;
+        font-weight: 700;
+        fill: #111827;
+        text-anchor: middle;
+        dominant-baseline: middle;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="wrapper">
+      <div id="palette"></div>
+      <div id="hint">Drag a node type into the canvas to create it.</div>
+      <div id="canvas">
+        <svg id="svg"></svg>
+      </div>
+    </div>
+
+    <script>
+      let lastArgs = {};
+      let dragging = null;
+      let linking = null;
+      let nodePositions = {};
+      let lastNodes = [];
+      const nodeSize = { w: 170, h: 92 };
+
+      function sendMessage(type, payload) {
+        window.parent.postMessage(
+          Object.assign({ isStreamlitMessage: true, type }, payload || {}),
+          "*"
+        );
+      }
+
+      function setFrameHeight(height) {
+        sendMessage("streamlit:setFrameHeight", { height });
+      }
+
+      function setComponentValue(value) {
+        sendMessage("streamlit:setComponentValue", { value });
+      }
+
+      function renderPalette(palette, typeLabels) {
+        const paletteEl = document.getElementById("palette");
+        paletteEl.innerHTML = "";
+        (palette || []).forEach((type) => {
+          const item = document.createElement("div");
+          item.className = "palette-item";
+          item.draggable = true;
+          item.dataset.nodeType = type;
+          item.textContent = (typeLabels && typeLabels[type]) || type;
+          item.addEventListener("dragstart", (event) => {
+            event.dataTransfer.setData("text/plain", type);
+          });
+          paletteEl.appendChild(item);
+        });
+      }
+
+      function layoutGroups(nodes, groupNodes) {
+        const groups = {};
+        groupNodes.forEach((group) => {
+          groups[group.id] = { ...group, bounds: null, children: [] };
+        });
+        nodes.forEach((node) => {
+          if (node.parent && groups[node.parent]) {
+            groups[node.parent].children.push(node);
+          }
+        });
+        Object.values(groups).forEach((group) => {
+          if (group.parent && groups[group.parent]) {
+            groups[group.parent].children.push(group);
+          }
+        });
+
+        function boundsFor(child) {
+          if (child.bounds) {
+            return child.bounds;
+          }
+          if (child.x !== undefined && child.y !== undefined) {
+            return {
+              minX: child.x - nodeSize.w / 2,
+              maxX: child.x + nodeSize.w / 2,
+              minY: child.y - nodeSize.h / 2,
+              maxY: child.y + nodeSize.h / 2,
+            };
+          }
+          if (!child.children || child.children.length === 0) {
+            return null;
+          }
+          let bounds = null;
+          child.children.forEach((inner) => {
+            const innerBounds = boundsFor(inner);
+            if (!innerBounds) return;
+            if (!bounds) {
+              bounds = { ...innerBounds };
+            } else {
+              bounds.minX = Math.min(bounds.minX, innerBounds.minX);
+              bounds.maxX = Math.max(bounds.maxX, innerBounds.maxX);
+              bounds.minY = Math.min(bounds.minY, innerBounds.minY);
+              bounds.maxY = Math.max(bounds.maxY, innerBounds.maxY);
+            }
+          });
+          if (!bounds) return null;
+          const pad = 24;
+          child.bounds = {
+            minX: bounds.minX - pad,
+            maxX: bounds.maxX + pad,
+            minY: bounds.minY - pad,
+            maxY: bounds.maxY + pad,
+          };
+          return child.bounds;
+        }
+
+        Object.values(groups).forEach((group) => {
+          boundsFor(group);
+        });
+        return groups;
+      }
+
+      function createSvgElement(tag, attrs) {
+        const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+        Object.entries(attrs || {}).forEach(([key, val]) => {
+          if (val !== undefined && val !== null) {
+            el.setAttribute(key, val);
+          }
+        });
+        return el;
+      }
+
+      function drawNode(svg, node) {
+        const group = createSvgElement("g", { "data-node-id": node.id });
+        group.style.cursor = "grab";
+        group.addEventListener("pointerdown", (event) => {
+          if (event.shiftKey) {
+            linking = { sourceId: node.id };
+            event.preventDefault();
+            return;
+          }
+          dragging = { id: node.id, offsetX: node.x - event.clientX, offsetY: node.y - event.clientY };
+          group.setPointerCapture(event.pointerId);
+        });
+        group.addEventListener("pointerup", (event) => {
+          if (linking) {
+            const target = getNodeAtPosition(event.clientX, event.clientY);
+            if (target && target.id !== linking.sourceId) {
+              setComponentValue({
+                event: "link",
+                source_id: linking.sourceId,
+                target_id: target.id,
+              });
+            }
+            linking = null;
+            removeTempLinkLine();
+            return;
+          }
+          if (!dragging || dragging.id !== node.id) return;
+          dragging = null;
+          group.releasePointerCapture(event.pointerId);
+          setComponentValue({
+            event: "dragstop",
+            selected_node_id: node.id,
+            position: { x: node.x, y: node.y },
+          });
+        });
+        group.addEventListener("click", () => {
+          setComponentValue({
+            event: "select",
+            selected_node_id: node.id,
+            position: { x: node.x, y: node.y },
+          });
+        });
+
+        const fill = node.color || "#64748b";
+        const stroke = "rgba(251, 146, 60, 0.85)";
+        group.appendChild(
+          createSvgElement("rect", {
+            x: node.x - nodeSize.w / 2,
+            y: node.y - nodeSize.h / 2,
+            width: nodeSize.w,
+            height: nodeSize.h,
+            rx: 16,
+            fill,
+            stroke,
+            "stroke-width": 1.2,
+            filter: "url(#nodeGlow)",
+          })
+        );
+
+        const iconMap = {
+          router: "R",
+          firewall: "FW",
+          switch: "SW",
+          core_switch: "CS",
+          server: "SV",
+          vm: "VM",
+          storage: "ST",
+          wireless_ap: "AP",
+          cloud: "CL",
+          cloud_vps: "CV",
+          domain: "DN",
+        };
+        const iconText = iconMap[node.nodeType] || "N";
+        group.appendChild(
+          createSvgElement("circle", {
+            cx: node.x - nodeSize.w / 2 + 14,
+            cy: node.y - nodeSize.h / 2 + 14,
+            r: 10,
+            fill: "#fde68a",
+          })
+        );
+        const icon = createSvgElement("text", {
+          x: node.x - nodeSize.w / 2 + 14,
+          y: node.y - nodeSize.h / 2 + 14,
+          class: "node-icon",
+        });
+        icon.textContent = iconText;
+        group.appendChild(icon);
+
+        const label = createSvgElement("text", { x: node.x - 56, y: node.y, class: "node-label" });
+        const lines = String(node.label || "").split("\n");
+        const lineHeight = 14;
+        const ipRegex = /^(?:\d{1,3}\.){3}\d{1,3}(?:\/\d{1,2})?$|:/;
+        lines.forEach((line, idx) => {
+          const tspan = createSvgElement("tspan", { x: node.x - 56, y: node.y + (idx - (lines.length - 1) / 2) * lineHeight });
+          const text = String(line || "").trim();
+          const firstWord = text.split(/\s+/)[0].toLowerCase();
+          if (idx === 0) {
+            tspan.setAttribute("class", "title-line");
+          } else if (text.toLowerCase().startsWith("avg")) {
+            tspan.setAttribute("class", "avg-line");
+          } else if (["up", "degraded", "down"].includes(firstWord)) {
+            const statusClass = `status-${firstWord}`;
+            tspan.setAttribute("class", `status-line ${statusClass}`);
+          } else if (ipRegex.test(text)) {
+            tspan.setAttribute("class", "ip-line");
+          }
+          tspan.textContent = line;
+          label.appendChild(tspan);
+        });
+        group.appendChild(label);
+        svg.appendChild(group);
+      }
+
+      function render(args) {
+        lastArgs = args || {};
+        const elements = lastArgs.elements || [];
+        const palette = lastArgs.palette || [];
+        const typeLabels = lastArgs.type_labels || {};
+        const width = lastArgs.width || 800;
+        const height = lastArgs.height || 600;
+
+        renderPalette(palette, typeLabels);
+
+        const canvas = document.getElementById("canvas");
+        const svg = document.getElementById("svg");
+        canvas.style.width = width + "px";
+        canvas.style.height = height + "px";
+        svg.setAttribute("width", width);
+        svg.setAttribute("height", height);
+        svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+        svg.innerHTML = "";
+        const defs = createSvgElement("defs");
+        const filter = createSvgElement("filter", { id: "nodeGlow", x: "-30%", y: "-30%", width: "160%", height: "160%" });
+        filter.appendChild(createSvgElement("feDropShadow", { dx: "0", dy: "2", stdDeviation: "4", floodColor: "#f59e0b", floodOpacity: "0.35" }));
+        filter.appendChild(createSvgElement("feDropShadow", { dx: "0", dy: "0", stdDeviation: "6", floodColor: "#fb923c", floodOpacity: "0.35" }));
+        defs.appendChild(filter);
+        svg.appendChild(defs);
+
+        const nodes = [];
+        const groupNodes = [];
+        const edges = [];
+        elements.forEach((el) => {
+          if (el.data && el.data.source && el.data.target) {
+            edges.push(el);
+          } else if (el.data && (el.data.parent || String(el.data.id || "").startsWith("group:"))) {
+            groupNodes.push({ id: el.data.id, label: el.data.label || "", parent: el.data.parent });
+          } else if (el.data) {
+            const pos = el.position || { x: 0, y: 0 };
+            nodes.push({
+              id: el.data.id,
+              label: el.data.label,
+              color: el.data.color,
+              shape: el.data.shape,
+              nodeType: el.data.node_type || "",
+              parent: el.data.parent,
+              x: pos.x || 0,
+              y: pos.y || 0,
+            });
+          }
+        });
+
+        nodes.forEach((node) => {
+          if (nodePositions[node.id]) {
+            node.x = nodePositions[node.id].x;
+            node.y = nodePositions[node.id].y;
+          }
+        });
+
+        const groups = layoutGroups(nodes, groupNodes);
+        Object.values(groups).forEach((group) => {
+          if (!group.bounds) return;
+          const rect = createSvgElement("rect", {
+            x: group.bounds.minX,
+            y: group.bounds.minY,
+            width: group.bounds.maxX - group.bounds.minX,
+            height: group.bounds.maxY - group.bounds.minY,
+            class: "group-rect",
+          });
+          svg.appendChild(rect);
+          const label = createSvgElement("text", {
+            x: group.bounds.minX + 8,
+            y: group.bounds.minY + 16,
+            class: "group-label",
+          });
+          label.textContent = group.label || group.id;
+          svg.appendChild(label);
+        });
+
+        edges.forEach((edge) => {
+          const src = nodes.find((n) => n.id === edge.data.source);
+          const tgt = nodes.find((n) => n.id === edge.data.target);
+          if (!src || !tgt) return;
+          const line = createSvgElement("line", {
+            x1: src.x,
+            y1: src.y,
+            x2: tgt.x,
+            y2: tgt.y,
+            class: "edge",
+            stroke: edge.data.color || "rgba(148, 163, 184, 0.7)",
+          });
+          svg.appendChild(line);
+        });
+
+        lastNodes = nodes.map((node) => ({ ...node }));
+        nodes.forEach((node) => drawNode(svg, node));
+
+        const totalHeight =
+          height +
+          (document.getElementById("palette").offsetHeight || 0) +
+          (document.getElementById("hint").offsetHeight || 0) +
+          24;
+        setFrameHeight(totalHeight);
+      }
+
+      document.getElementById("canvas").addEventListener("dragover", (event) => {
+        event.preventDefault();
+      });
+      document.getElementById("canvas").addEventListener("drop", (event) => {
+        event.preventDefault();
+        const nodeType = event.dataTransfer.getData("text/plain");
+        if (!nodeType) return;
+        const rect = event.currentTarget.getBoundingClientRect();
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+        setComponentValue({
+          event: "create",
+          node_type: nodeType,
+          position: { x, y },
+        });
+      });
+      document.getElementById("svg").addEventListener("pointermove", (event) => {
+        if (!dragging) return;
+        const nodeId = dragging.id;
+        const x = event.clientX + dragging.offsetX;
+        const y = event.clientY + dragging.offsetY;
+        nodePositions[nodeId] = { x, y };
+        render(lastArgs);
+      });
+      document.getElementById("svg").addEventListener("pointermove", (event) => {
+        if (!linking) return;
+        drawTempLinkLine(event.clientX, event.clientY);
+      });
+
+      function getNodeAtPosition(clientX, clientY) {
+        const canvas = document.getElementById("canvas");
+        const rect = canvas.getBoundingClientRect();
+        const x = clientX - rect.left;
+        const y = clientY - rect.top;
+        const hit = lastNodes.find((node) => {
+          const dx = Math.abs(node.x - x);
+          const dy = Math.abs(node.y - y);
+          return dx <= nodeSize.w / 2 && dy <= nodeSize.h / 2;
+        });
+        return hit || null;
+      }
+
+      function drawTempLinkLine(clientX, clientY) {
+        const svg = document.getElementById("svg");
+        let line = document.getElementById("temp-link-line");
+        const canvas = document.getElementById("canvas");
+        const rect = canvas.getBoundingClientRect();
+        const x = clientX - rect.left;
+        const y = clientY - rect.top;
+        const source = lastNodes.find((n) => n.id === linking.sourceId);
+        if (!source) return;
+        if (!line) {
+          line = createSvgElement("line", {
+            id: "temp-link-line",
+            x1: source.x,
+            y1: source.y,
+            x2: x,
+            y2: y,
+            class: "edge",
+          });
+          svg.appendChild(line);
+        } else {
+          line.setAttribute("x1", source.x);
+          line.setAttribute("y1", source.y);
+          line.setAttribute("x2", x);
+          line.setAttribute("y2", y);
+        }
+      }
+
+      function removeTempLinkLine() {
+        const line = document.getElementById("temp-link-line");
+        if (line && line.parentNode) {
+          line.parentNode.removeChild(line);
+        }
+      }
+
+      window.addEventListener("message", (event) => {
+        const data = event.data;
+        if (!data || !data.type) {
+          return;
+        }
+        if (data.type === "streamlit:render") {
+          render(data.args);
+        }
+      });
+
+      sendMessage("streamlit:componentReady", { apiVersion: 1 });
+      setFrameHeight(800);
+    </script>
+  </body>
+</html>
