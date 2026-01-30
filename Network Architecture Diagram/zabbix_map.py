@@ -12,11 +12,8 @@ from typing import Dict, List, Tuple
 import streamlit as st
 import streamlit.components.v1 as components
 
-try:
-    import httpx
-    HAS_HTTPX = True
-except Exception:
-    HAS_HTTPX = False
+from Alert.wx_webhook import send_webhook
+from Alert.e_mail import send_email
 
 try:
     from ping3 import ping as ping_once
@@ -25,6 +22,9 @@ except Exception:
     HAS_PING3 = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(BASE_DIR)
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "zabbix_map.db")
 COMPONENT_DIR = os.path.join(BASE_DIR, "components", "zabbix_map_component")
@@ -52,6 +52,7 @@ NODE_TYPES = [
     "cloud",
     "cloud_vps",
     "domain",
+    "text",
 ]
 
 FLOOR_OPTIONS = ["B3", "B2", "B1", "1F", "2F", "3F", "4F", "5F"]
@@ -65,6 +66,7 @@ TYPE_SHAPES = {
     "storage": "hexagon",
     "wireless_ap": "ellipse",
     "domain": "ellipse",
+    "text": "round-rectangle",
 }
 
 STATUS_COLORS = {
@@ -98,6 +100,13 @@ def ensure_db():
         )
         """
     )
+    # Add size columns if missing (for node resizing).
+    cur.execute("PRAGMA table_info(nodes)")
+    cols = {row[1] for row in cur.fetchall()}
+    if "size_w" not in cols:
+        cur.execute("ALTER TABLE nodes ADD COLUMN size_w REAL")
+    if "size_h" not in cols:
+        cur.execute("ALTER TABLE nodes ADD COLUMN size_h REAL")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS edges (
@@ -144,6 +153,14 @@ def ensure_db():
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
     cur.execute("SELECT COUNT(*) FROM alert_config")
     if cur.fetchone()[0] == 0:
         cur.execute(
@@ -151,6 +168,14 @@ def ensure_db():
             INSERT INTO alert_config
             (id, down_threshold, cooldown_sec, webhook_url)
             VALUES (1, 3, 300, '')
+            """
+        )
+    cur.execute("SELECT COUNT(*) FROM settings WHERE key = 'ping_retention_days'")
+    if cur.fetchone()[0] == 0:
+        cur.execute(
+            """
+            INSERT INTO settings (key, value)
+            VALUES ('ping_retention_days', '30')
             """
         )
     conn.commit()
@@ -238,8 +263,8 @@ def upsert_node(node: Dict):
     cur.execute(
         """
         INSERT INTO nodes
-        (id, name, ip, node_type, site, floor, line, pos_x, pos_y, last_status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, name, ip, node_type, site, floor, line, pos_x, pos_y, size_w, size_h, last_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             name=excluded.name,
             ip=excluded.ip,
@@ -248,7 +273,9 @@ def upsert_node(node: Dict):
             floor=excluded.floor,
             line=excluded.line,
             pos_x=excluded.pos_x,
-            pos_y=excluded.pos_y
+            pos_y=excluded.pos_y,
+            size_w=excluded.size_w,
+            size_h=excluded.size_h
         """,
         (
             node["id"],
@@ -260,6 +287,8 @@ def upsert_node(node: Dict):
             node.get("line"),
             node.get("pos_x", 0),
             node.get("pos_y", 0),
+            node.get("size_w"),
+            node.get("size_h"),
             node.get("last_status", "unknown"),
         ),
     )
@@ -277,6 +306,21 @@ def update_node_position(node_id: str, pos_x: float, pos_y: float):
         WHERE id=?
         """,
         (pos_x, pos_y, node_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_node_size(node_id: str, size_w: float, size_h: float):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE nodes
+        SET size_w=?, size_h=?
+        WHERE id=?
+        """,
+        (size_w, size_h, node_id),
     )
     conn.commit()
     conn.close()
@@ -371,13 +415,14 @@ def record_ping(node_id: str, rtt_ms: float, loss: float, status: str):
     conn.close()
 
 
-def update_alert_state(node_id: str, is_down: bool, threshold: int, cooldown: int) -> Tuple[bool, int]:
+def update_alert_state(node_id: str, is_down: bool, threshold: int, cooldown: int) -> Tuple[bool, int, bool]:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT down_count, last_alert_ts FROM alert_state WHERE node_id = ?", (node_id,))
     row = cur.fetchone()
     down_count = row[0] if row else 0
     last_alert_ts = row[1] if row else None
+    was_down = down_count > 0
 
     if is_down:
         down_count += 1
@@ -403,7 +448,8 @@ def update_alert_state(node_id: str, is_down: bool, threshold: int, cooldown: in
     )
     conn.commit()
     conn.close()
-    return should_alert, down_count
+    recovered = was_down and not is_down
+    return should_alert, down_count, recovered
 
 
 def load_alert_config() -> Dict:
@@ -442,32 +488,49 @@ def save_alert_config(cfg: Dict):
     conn.close()
 
 
-def send_webhook(url: str, payload: Dict):
-    if not url or not HAS_HTTPX:
+def load_setting(key: str, default: str = "") -> str:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] is not None else default
+
+
+def save_setting(key: str, value: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO settings (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+def cleanup_ping_samples(retention_days: int):
+    if retention_days <= 0:
         return
-    try:
-        httpx.post(url, json=payload, timeout=5.0)
-    except Exception:
-        pass
+    cutoff = time.time() - (retention_days * 86400)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM ping_samples WHERE ts < ?", (cutoff,))
+    conn.commit()
+    conn.close()
 
 
-def send_email(cfg: Dict, subject: str, body: str):
-    import smtplib
-    from email.message import EmailMessage
+def clear_all_ping_samples():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM ping_samples")
+    conn.commit()
+    conn.close()
 
-    if not cfg.get("email_to") or not cfg.get("smtp_host"):
-        return
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = cfg.get("email_from") or cfg.get("smtp_user")
-    msg["To"] = cfg.get("email_to")
-    msg.set_content(body)
 
-    with smtplib.SMTP(cfg["smtp_host"], cfg.get("smtp_port", 587)) as smtp:
-        smtp.starttls()
-        if cfg.get("smtp_user"):
-            smtp.login(cfg["smtp_user"], cfg.get("smtp_pass", ""))
-        smtp.send_message(msg)
 
 
 def build_elements(nodes: List[Dict], edges: List[Dict], group_mode: str) -> List[Dict]:
@@ -504,7 +567,9 @@ def build_elements(nodes: List[Dict], edges: List[Dict], group_mode: str) -> Lis
         ip_text = node.get("ip") or "--"
         avg_rtt = fetch_avg_rtt(node["id"], limit=5)
         avg_text = f"{avg_rtt:.1f}ms" if avg_rtt is not None else "--"
-        if node_type == "domain":
+        if node_type == "text":
+            label = f"{node['name']}"
+        elif node_type == "domain":
             label = f"{node['name']}\n{ip_text}\n{status} {rtt_text} {loss_text}\navg {avg_text}"
         else:
             label = f"{node['name']}\n{ip_text}\n{status} {rtt_text} {loss_text}\navg {avg_text}"
@@ -518,6 +583,8 @@ def build_elements(nodes: List[Dict], edges: List[Dict], group_mode: str) -> Lis
                     "shape": TYPE_SHAPES.get(node_type, "ellipse"),
                     "node_type": node_type,
                     "parent": node.get("parent"),
+                    "size_w": node.get("size_w"),
+                    "size_h": node.get("size_h"),
                 },
                 "position": {"x": node.get("pos_x", 0), "y": node.get("pos_y", 0)},
             }
@@ -599,7 +666,7 @@ def ping_sweep(nodes: List[Dict], alert_cfg: Dict):
             loss = 0.0
 
         record_ping(node["id"], rtt_val, loss, status)
-        should_alert, down_count = update_alert_state(
+        should_alert, down_count, recovered = update_alert_state(
             node["id"],
             status == "down",
             alert_cfg["down_threshold"],
@@ -612,12 +679,35 @@ def ping_sweep(nodes: List[Dict], alert_cfg: Dict):
                 "ip": ip or target,
                 "status": status,
                 "down_count": down_count,
+                "site": node.get("site", ""),
+                "floor": node.get("floor", ""),
+                "line": node.get("line", ""),
+                "rtt_ms": rtt_val,
+                "loss": loss,
             }
             send_webhook(alert_cfg.get("webhook_url", ""), payload)
             send_email(
                 alert_cfg,
                 subject=f"[Zabbix Map] {node['name']} down",
                 body=f"Node {node['name']} ({ip}) is down for {down_count} checks.",
+            )
+        if recovered:
+            payload = {
+                "node_id": node["id"],
+                "name": node["name"],
+                "ip": ip or target,
+                "status": "recovered",
+                "site": node.get("site", ""),
+                "floor": node.get("floor", ""),
+                "line": node.get("line", ""),
+                "rtt_ms": rtt_val,
+                "loss": loss,
+            }
+            send_webhook(alert_cfg.get("webhook_url", ""), payload)
+            send_email(
+                alert_cfg,
+                subject=f"[Zabbix Map] {node['name']} recovered",
+                body=f"Node {node['name']} ({ip}) recovered.",
             )
 
 
@@ -668,6 +758,8 @@ def run():
 
     ensure_db()
     # Keep map empty by default; only add nodes manually.
+    if "component_key" not in st.session_state:
+        st.session_state["component_key"] = 0
 
     with st.sidebar:
         st.subheader("Filters")
@@ -684,11 +776,35 @@ def run():
             st.session_state["auto_ping_enabled"] = True
             st.session_state["auto_ping_interval"] = max(10, int(interval_sec))
             st.session_state["last_ping_ts"] = 0.0
-            st.session_state["pending_node"] = None
             st.session_state["node_editor_open"] = False
             st.session_state["run_ping_once"] = False
         if st.button("Stop auto ping"):
             st.session_state["auto_ping_enabled"] = False
+        st.divider()
+        st.subheader("Ping retention")
+        retention_options = [7, 30, 180, 365]
+        current_retention = load_setting("ping_retention_days", "30")
+        try:
+            current_retention_val = int(current_retention)
+        except Exception:
+            current_retention_val = 30
+        if current_retention_val not in retention_options:
+            current_retention_val = 30
+        retention_days = st.selectbox(
+            "Keep data (days)",
+            retention_options,
+            index=retention_options.index(current_retention_val),
+        )
+        col_apply, col_clear = st.columns(2)
+        with col_apply:
+            if st.button("Apply retention"):
+                save_setting("ping_retention_days", str(retention_days))
+                cleanup_ping_samples(retention_days)
+                st.success(f"Retention set to {retention_days} days")
+        with col_clear:
+            if st.button("Clear ping data"):
+                clear_all_ping_samples()
+                st.success("Ping data cleared")
 
     filters = {"site": site, "floor": floor, "line": line}
     nodes = fetch_nodes(filters)
@@ -706,198 +822,195 @@ def run():
         if now - last_ts >= interval:
             ping_sweep(nodes, load_alert_config())
             st.session_state["last_ping_ts"] = now
-        if HAS_AUTOREFRESH:
-            st_autorefresh(interval=1000, key="auto-ping")
-        else:
-            time.sleep(1)
-            if hasattr(st, "rerun"):
-                st.rerun()
+        if True:
+            if HAS_AUTOREFRESH:
+                st_autorefresh(interval=1000, key="auto-ping")
             else:
-                st.experimental_rerun()
-
-    left, right = st.columns([3, 1])
-    with left:
-        elements = build_elements(nodes, edges, group_mode)
-        stylesheet = [
-            {
-                "selector": "node",
-                "style": {
-                    "label": "data(label)",
-                    "background-color": "data(color)",
-                    "shape": "data(shape)",
-                    "text-wrap": "wrap",
-                    "text-max-width": "140px",
-                    "color": "#e5e7eb",
-                    "font-size": "10px",
-                    "text-outline-color": "#0f172a",
-                    "text-outline-width": 2,
-                },
-            },
-            {
-                "selector": "edge",
-                "style": {
-                    "line-color": "data(color)",
-                    "target-arrow-color": "data(color)",
-                    "target-arrow-shape": "triangle",
-                    "curve-style": "bezier",
-                    "width": 2,
-                },
-            },
-            {
-                "selector": ":parent",
-                "style": {
-                    "background-opacity": 0.08,
-                    "border-color": "#94a3b8",
-                    "border-width": 1,
-                    "label": "data(label)",
-                    "font-size": "11px",
-                    "text-valign": "top",
-                },
-            },
-        ]
-        event = MAP_COMPONENT(
-            elements=elements,
-            stylesheet=stylesheet,
-            width=1100,
-            height=680,
-            palette=NODE_TYPES,
-            type_shapes=TYPE_SHAPES,
-            key="zabbix-map",
-        )
-
-    with right:
-        node_ids = [n["id"] for n in nodes]
-        selected_id = None
-        selected_pos = None
-        if isinstance(event, dict) and event.get("event") in {"select", "dragstop"}:
-            selected_id = event.get("selected_node_id")
-            selected_pos = event.get("position")
-            st.session_state["node_editor_open"] = True
-        elif isinstance(event, dict) and event.get("event") == "create":
-            st.session_state["pending_node"] = {
-                "node_type": event.get("node_type", "router"),
-                "pos_x": event.get("position", {}).get("x", 100),
-                "pos_y": event.get("position", {}).get("y", 100),
-            }
-        elif isinstance(event, dict) and event.get("event") == "link":
-            source_id = event.get("source_id")
-            target_id = event.get("target_id")
-            if source_id and target_id and source_id != target_id:
-                edge_id = f"e-{int(time.time() * 1000)}"
-                upsert_edge({"id": edge_id, "source": source_id, "target": target_id, "status": "unknown"})
-
-        with st.expander("Node editor", expanded=st.session_state.get("node_editor_open", False)):
-            if selected_id in node_ids:
-                edit_id = selected_id
-            else:
-                edit_id = st.selectbox("Select node", node_ids) if node_ids else None
-            target = next((n for n in nodes if n["id"] == edit_id), None)
-
-            if target:
-                node_type = st.selectbox("Type", NODE_TYPES, index=NODE_TYPES.index(target["node_type"]))
-                if node_type == "domain":
-                    name_value = st.text_input("Domain", value=target["name"])
-                    ip_value = ""
+                time.sleep(1)
+                if hasattr(st, "rerun"):
+                    st.rerun()
                 else:
-                    name_value = st.text_input("Name", value=target["name"])
-                    ip_value = st.text_input("IP", value=target.get("ip", ""))
-                current_floor = target.get("floor", "") or ""
-                floor_choices = FLOOR_OPTIONS[:]
-                if current_floor and current_floor not in floor_choices:
-                    floor_choices = [current_floor] + floor_choices
-                floor_val = st.selectbox("Floor", floor_choices, index=floor_choices.index(current_floor) if current_floor in floor_choices else 0)
-                if st.button("Save node"):
-                    upsert_node(
-                        {
-                            "id": edit_id,
-                            "name": name_value.strip() or target["name"],
-                            "ip": ip_value.strip(),
-                            "node_type": node_type,
-                            "site": target.get("site", ""),
-                            "floor": floor_val,
-                            "line": target.get("line", ""),
-                            "pos_x": target.get("pos_x", 0),
-                            "pos_y": target.get("pos_y", 0),
-                            "last_status": target.get("last_status", "unknown"),
-                        }
-                    )
-                    st.success("Node updated")
-                if st.button("Delete node", type="secondary"):
-                    conn = sqlite3.connect(DB_PATH)
-                    cur = conn.cursor()
-                    cur.execute("DELETE FROM edges WHERE source = ? OR target = ?", (edit_id, edit_id))
-                    cur.execute("DELETE FROM nodes WHERE id = ?", (edit_id,))
-                    conn.commit()
-                    conn.close()
-                    st.session_state["page"] = "zabbix_map"
-                    st.rerun()
-                if selected_pos and selected_pos.get("x") is not None and selected_pos.get("y") is not None:
-                    pos_x = float(selected_pos["x"])
-                    pos_y = float(selected_pos["y"])
-                    if snap_on_save:
-                        pos_x = snap_value(pos_x, int(grid_size))
-                        pos_y = snap_value(pos_y, int(grid_size))
-                    if isinstance(event, dict) and event.get("event") == "dragstop":
-                        update_node_position(edit_id, pos_x, pos_y)
+                    st.experimental_rerun()
 
-        st.divider()
-        pending = st.session_state.get("pending_node")
-        if pending:
-            def render_create_dialog():
-                st.write("Select defaults for the new node (edit details on the right panel after creation).")
-                with st.form("create-node-form", clear_on_submit=False):
-                    type_options = NODE_TYPES[:]
-                    default_type = pending.get("node_type") if pending.get("node_type") in type_options else type_options[0]
-                    node_type = st.selectbox("Type", type_options, index=type_options.index(default_type))
-                    if node_type == "domain":
-                        hostname = st.text_input("Domain", value="")
-                        ip_addr = ""
-                    else:
-                        default_name = f"New {node_type.replace('_', ' ').title()}"
-                        hostname = st.text_input("Hostname", value=default_name)
-                        ip_addr = st.text_input("IP", value="")
-                    floor_val = st.selectbox("Floor", FLOOR_OPTIONS, index=0)
-                    submit = st.form_submit_button("Create node", use_container_width=True)
-                col_cancel = st.columns(1)[0]
-                with col_cancel:
-                    if st.button("Cancel", use_container_width=True):
-                        st.session_state["pending_node"] = None
-                        st.rerun()
-                if submit:
-                    new_id = f"node-{int(time.time() * 1000)}"
-                    new_name = hostname.strip() or f"New {node_type.replace('_', ' ').title()}"
-                    upsert_node(
-                        {
-                            "id": new_id,
-                            "name": new_name,
-                            "ip": ip_addr.strip(),
-                            "node_type": node_type,
-                            "site": "",
-                            "floor": floor_val,
-                            "line": "",
-                            "pos_x": pending.get("pos_x", 100),
-                            "pos_y": pending.get("pos_y", 100),
-                            "last_status": "unknown",
-                        }
-                    )
-                    st.session_state["pending_node"] = None
-                    st.session_state["page"] = "zabbix_map"
-                    st.rerun()
+    elements = build_elements(nodes, edges, group_mode)
+    stylesheet = [
+        {
+            "selector": "node",
+            "style": {
+                "label": "data(label)",
+                "background-color": "data(color)",
+                "shape": "data(shape)",
+                "text-wrap": "wrap",
+                "text-max-width": "140px",
+                "color": "#e5e7eb",
+                "font-size": "10px",
+                "text-outline-color": "#0f172a",
+                "text-outline-width": 2,
+            },
+        },
+        {
+            "selector": "edge",
+            "style": {
+                "line-color": "data(color)",
+                "target-arrow-color": "data(color)",
+                "target-arrow-shape": "triangle",
+                "curve-style": "bezier",
+                "width": 2,
+            },
+        },
+        {
+            "selector": ":parent",
+            "style": {
+                "background-opacity": 0.08,
+                "border-color": "#94a3b8",
+                "border-width": 1,
+                "label": "data(label)",
+                "font-size": "11px",
+                "text-valign": "top",
+            },
+        },
+    ]
+    event = MAP_COMPONENT(
+        elements=elements,
+        stylesheet=stylesheet,
+        height=680,
+        palette=NODE_TYPES,
+        type_shapes=TYPE_SHAPES,
+        node_data=nodes,
+        node_types=NODE_TYPES,
+        floor_options=FLOOR_OPTIONS,
+        key=f"zabbix-map-{st.session_state['component_key']}",
+    )
 
-            if hasattr(st, "dialog"):
-                @st.dialog("Create node")
-                def _dlg():
-                    render_create_dialog()
-                _dlg()
+    node_ids = [n["id"] for n in nodes]
+    selected_pos = None
+    last_ts_map = st.session_state.get("last_event_ts", {})
+    if isinstance(event, dict) and event.get("event") == "select":
+        pass
+    elif isinstance(event, dict) and event.get("event") == "dragstop":
+        selected_pos = event.get("position")
+    elif isinstance(event, dict) and event.get("event") == "edit_save":
+        ev_ts = event.get("ts")
+        if ev_ts is not None and last_ts_map.get("edit_save") == ev_ts:
+            return
+        if ev_ts is not None:
+            last_ts_map["edit_save"] = ev_ts
+            st.session_state["last_event_ts"] = last_ts_map
+        edit_id = event.get("node_id")
+        if edit_id:
+            target = next((n for n in nodes if n["id"] == edit_id), None)
+            if target:
+                upsert_node(
+                    {
+                        "id": edit_id,
+                        "name": (event.get("name") or "").strip() or target["name"],
+                        "ip": (event.get("ip") or "").strip(),
+                        "node_type": event.get("node_type") or target.get("node_type"),
+                        "site": target.get("site", ""),
+                        "floor": event.get("floor") or target.get("floor"),
+                        "line": target.get("line", ""),
+                        "pos_x": target.get("pos_x", 0),
+                        "pos_y": target.get("pos_y", 0),
+                        "size_w": target.get("size_w"),
+                        "size_h": target.get("size_h"),
+                        "last_status": target.get("last_status", "unknown"),
+                    }
+                )
+        st.session_state["page"] = "zabbix_map"
+        st.session_state["component_key"] += 1
+        st.rerun()
+    elif isinstance(event, dict) and event.get("event") == "create_save":
+        ev_ts = event.get("ts")
+        if ev_ts is not None and last_ts_map.get("create_save") == ev_ts:
+            return
+        if ev_ts is not None:
+            last_ts_map["create_save"] = ev_ts
+            st.session_state["last_event_ts"] = last_ts_map
+        node_type = event.get("node_type") or "router"
+        name_value = (event.get("name") or "").strip()
+        ip_value = (event.get("ip") or "").strip()
+        floor_val = event.get("floor") or ""
+        pos = event.get("position") or {}
+        new_id = f"node-{int(time.time() * 1000)}"
+        new_name = name_value or f"New {node_type.replace('_', ' ').title()}"
+        upsert_node(
+            {
+                "id": new_id,
+                "name": new_name,
+                "ip": ip_value,
+                "node_type": node_type,
+                "site": "",
+                "floor": floor_val,
+                "line": "",
+                "pos_x": pos.get("x", 100),
+                "pos_y": pos.get("y", 100),
+                "size_w": event.get("size_w"),
+                "size_h": event.get("size_h"),
+                "last_status": "unknown",
+            }
+        )
+        st.session_state["page"] = "zabbix_map"
+        st.session_state["component_key"] += 1
+        st.rerun()
+    elif isinstance(event, dict) and event.get("event") == "delete_confirm":
+        ev_ts = event.get("ts")
+        if ev_ts is not None and last_ts_map.get("delete_confirm") == ev_ts:
+            return
+        if ev_ts is not None:
+            last_ts_map["delete_confirm"] = ev_ts
+            st.session_state["last_event_ts"] = last_ts_map
+        delete_id = event.get("node_id")
+        if delete_id:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            target = next((n for n in nodes if n["id"] == delete_id), None)
+            if target and target.get("node_type") == "domain" and target.get("name"):
+                cur.execute(
+                    "SELECT id FROM nodes WHERE node_type = 'domain' AND name = ?",
+                    (target["name"],),
+                )
+                ids = [row[0] for row in cur.fetchall()]
+                for node_id in ids:
+                    cur.execute("DELETE FROM edges WHERE source = ? OR target = ?", (node_id, node_id))
+                    cur.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
             else:
-                st.subheader("Create node")
-                render_create_dialog()
+                cur.execute("DELETE FROM edges WHERE source = ? OR target = ?", (delete_id, delete_id))
+                cur.execute("DELETE FROM nodes WHERE id = ?", (delete_id,))
+            conn.commit()
+            conn.close()
+        st.session_state["page"] = "zabbix_map"
+        st.session_state["component_key"] += 1
+        st.rerun()
+    elif isinstance(event, dict) and event.get("event") == "link":
+        source_id = event.get("source_id")
+        target_id = event.get("target_id")
+        if source_id and target_id and source_id != target_id:
+            edge_id = f"e-{int(time.time() * 1000)}"
+            upsert_edge({"id": edge_id, "source": source_id, "target": target_id, "status": "unknown"})
+    if selected_pos and selected_pos.get("x") is not None and selected_pos.get("y") is not None:
+        pos_x = float(selected_pos["x"])
+        pos_y = float(selected_pos["y"])
+        if snap_on_save:
+            pos_x = snap_value(pos_x, int(grid_size))
+            pos_y = snap_value(pos_y, int(grid_size))
+        if isinstance(event, dict) and event.get("event") == "dragstop":
+            update_node_position(event.get("selected_node_id"), pos_x, pos_y)
+    if isinstance(event, dict) and event.get("event") == "resize":
+        node_id = event.get("node_id")
+        size = event.get("size") or {}
+        if node_id and size.get("w") and size.get("h"):
+            update_node_size(node_id, float(size["w"]), float(size["h"]))
 
     st.divider()
-    with st.expander("Ping & alert", expanded=False):
+
+
+
+    st.divider()
+    with st.expander("Alert", expanded=False):
         alert_cfg = load_alert_config()
-        down_threshold = st.number_input("Down threshold (N)", min_value=1, max_value=20, value=alert_cfg["down_threshold"])
+        down_threshold = st.number_input("Down threshold (N)", min_value=1, max_value=20, value=max(1, alert_cfg["down_threshold"]))
         cooldown_sec = st.number_input("Cooldown (sec)", min_value=60, max_value=3600, value=alert_cfg["cooldown_sec"])
+        st.caption("Cooldown = same node alert minimum interval (after a trigger, wait this long before next alert).")
         webhook_url = st.text_input("Webhook URL", value=alert_cfg.get("webhook_url", ""))
         email_to = st.text_input("Email to", value=alert_cfg.get("email_to", ""))
         email_from = st.text_input("Email from", value=alert_cfg.get("email_from", ""))
@@ -908,10 +1021,15 @@ def run():
         smtp_port = st.number_input("SMTP port", min_value=1, max_value=65535, value=int(smtp_port_val))
         smtp_user = st.text_input("SMTP user", value=alert_cfg.get("smtp_user", ""))
         smtp_pass = st.text_input("SMTP pass", value=alert_cfg.get("smtp_pass", ""), type="password")
-        if st.button("Save alert config"):
+        col_save, col_test = st.columns([1, 1])
+        with col_save:
+            save_clicked = st.button("Save alert config")
+        with col_test:
+            test_clicked = st.button("Test webhook")
+        if save_clicked:
             save_alert_config(
                 {
-                    "down_threshold": int(down_threshold),
+                    "down_threshold": max(1, int(down_threshold)),
                     "cooldown_sec": int(cooldown_sec),
                     "webhook_url": webhook_url,
                     "email_to": email_to,
@@ -923,6 +1041,26 @@ def run():
                 }
             )
             st.success("Alert config saved")
+        if test_clicked:
+            url = webhook_url.strip() if webhook_url else ""
+            if url:
+                st.caption(f"URL: {url}")
+            result = send_webhook(
+                url,
+                {
+                    "test": True,
+                    "content": "Webhook test from Cisco Maintain Tools",
+                    "mentioned_list": ["@all"],
+                    "ts": time.time(),
+                },
+            )
+            if result.get("ok"):
+                st.success(f"Webhook sent: {result.get('status_code')}")
+                resp_text = result.get("text")
+                if resp_text:
+                    st.code(resp_text, language="json")
+            else:
+                st.error(f"Webhook error: {result.get('error')}")
 
     st.divider()
     with st.expander("RTT chart (last 60s)", expanded=False):
