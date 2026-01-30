@@ -2,7 +2,7 @@
 - System Environment: Oracle Linux R8.X
 - System Dependencies: yum install gcc openssl-devel bzip2-devel libffi-devel zlib-devel graphviz -y
 - Python: 3.11
-- Python Dependencies: pip3 install streamlit pandas netmiko paramiko graphviz
+- Python Dependencies: pip3 install streamlit pandas netmiko paramiko graphviz fastapi uvicorn websockets ping3 pydantic aiofiles python-multipart sqlalchemy aiosqlite psutil httpx rich streamlit-autorefresh
 - How To Run
 <br> nohup streamlit run cmt.py --server.address 0.0.0.0 --server.port 8500 > streamlit.log 2>&1 & <br>
 <br> http://IP:8500 <br>
