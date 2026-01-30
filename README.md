@@ -15,6 +15,10 @@
 #=== Cisco General ====
 <img width="1260" height="582" alt="image" src="https://github.com/user-attachments/assets/d9d62116-eb6e-48dd-8161-b5589671f3a0" />
 
+#=== Version Update ==
+<br> Added Network Architecture Diagram (Alerts, Ping) <br>
+<br> Optimize button interface <br>
+
 
 
 
