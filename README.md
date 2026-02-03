@@ -9,6 +9,14 @@
 - Check execution program
 <br> ps -ef | grep streamlit | grep -v grep <br>
 
+- Firewall rules
+# Web ui
+sudo firewall-cmd --add-port=8500/tcp --permanent 
+# WebSocket
+sudo firewall-cmd --add-port=8765/tcp --permanent 
+# 
+sudo firewall-cmd --reload
+
 #=== IE Optical Fiber Health ====
 <img width="976" height="527" alt="image" src="https://github.com/user-attachments/assets/3571a127-f98c-4bf7-8f81-f8cdb50aea6e" />
 

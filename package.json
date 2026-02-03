@@ -1,0 +1,25 @@
+{
+  "name": "cmt",
+  "version": "1.0.0",
+  "description": "- Author: ChatGPT | Gemini | Lingma\r - System Environment: Oracle Linux R8.X\r - System Dependencies: yum install gcc openssl-devel bzip2-devel libffi-devel zlib-devel graphviz -y\r - Python: 3.11\r - Python Dependencies: pip3 install streamlit pandas netmiko paramiko graphviz fastapi uvicorn websockets ping3 pydantic aiofiles python-multipart sqlalchemy aiosqlite psutil httpx rich streamlit-cytoscapejs streamlit-autorefresh\r - How To Run\r <br> nohup streamlit run cmt.py --server.address 0.0.0.0 --server.port 8500 > streamlit.log 2>&1 & <br>\r <br> http://IP:8500 <br>\r - Check execution program\r <br> ps -ef | grep streamlit | grep -v grep <br>",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cddisk2000/CMT.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/cddisk2000/CMT/issues"
+  },
+  "homepage": "https://github.com/cddisk2000/CMT#readme",
+  "dependencies": {
+    "xterm": "^5.3.0",
+    "xterm-addon-fit": "^0.8.0"
+  }
+}

@@ -7,7 +7,9 @@ import json
 import sqlite3
 import socket
 import time
-import webbrowser
+import threading
+import asyncio
+from urllib.parse import parse_qs
 from typing import Dict, List, Tuple
 
 import streamlit as st
@@ -23,11 +25,22 @@ try:
 except Exception:
     HAS_PING3 = False
 
+try:
+    import asyncssh
+    import websockets
+    HAS_SSH_WS = True
+except Exception:
+    HAS_SSH_WS = False
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(BASE_DIR)
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 DATA_DIR = os.path.join(BASE_DIR, "data")
+ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+XTERM_JS_PATH = os.path.join(ASSETS_DIR, "xterm.min.js")
+XTERM_FIT_PATH = os.path.join(ASSETS_DIR, "xterm-addon-fit.min.js")
+XTERM_CSS_PATH = os.path.join(ASSETS_DIR, "xterm.css")
 DB_PATH = os.path.join(DATA_DIR, "zabbix_map.db")
 COMPONENT_DIR = os.path.join(BASE_DIR, "components", "zabbix_map_component")
 MAP_COMPONENT = components.declare_component("zabbix_map_component", path=COMPONENT_DIR)
@@ -35,6 +48,12 @@ MAP_COMPONENT = components.declare_component("zabbix_map_component", path=COMPON
 DAEMON_PID_PATH = os.path.join(DATA_DIR, "ping_daemon.pid")
 DAEMON_STOP_PATH = os.path.join(DATA_DIR, "ping_daemon.stop")
 DAEMON_HB_PATH = os.path.join(DATA_DIR, "ping_daemon.hb")
+
+SSH_WS_PORT = int(os.getenv("SSH_WS_PORT", "8765"))
+SSH_WS_STARTED = False
+ALLOWED_SSH_TARGETS = set()
+SSH_WS_READY = threading.Event()
+SSH_WS_ERROR = None
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -392,38 +411,156 @@ def _safe_port(value: str) -> str:
     return text
 
 
-def open_web(ip: str, port: str):
+def _service_url(service: str, ip: str, port: str) -> str:
     if not ip:
-        return
+        return ""
     port = _safe_port(port)
     if not port:
-        st.warning("Web Port is empty.")
-        return
-    url = f"http://{ip}:{port}"
-    webbrowser.open(url)
+        return ""
+    service = (service or "").lower()
+    if service == "web":
+        scheme = "https" if port in {"443", "8443"} else "http"
+        return f"{scheme}://{ip}:{port}"
+    if service == "ssh":
+        return f"ssh://{ip}:{port}"
+    if service == "rdp":
+        return f"rdp://{ip}:{port}"
+    return ""
 
 
-def open_ssh(ip: str, port: str):
-    if not ip:
-        return
-    port = _safe_port(port)
-    if not port:
-        st.warning("SSH Port is empty.")
-        return
+def enqueue_client_action(service: str, ip: str, port: str) -> bool:
+    url = _service_url(service, ip, port)
+    if not url:
+        label = service.upper() if service else "Service"
+        st.warning(f"{label} Port is empty.")
+        return False
+    ts = int(time.time() * 1000)
+    st.session_state["client_action"] = {
+        "type": "open_url",
+        "url": url,
+        "label": service,
+        "ts": ts,
+    }
+    st.session_state["client_action_note"] = f"Open: {url}"
+    return True
+
+
+def update_allowed_ssh_targets(nodes: List[Dict]):
+    allowed = set()
+    for node in nodes:
+        ip = (node.get("ip") or "").strip()
+        port = (node.get("ssh_port") or "").strip()
+        if ip and port:
+            allowed.add(f"{ip}:{port}")
+    ALLOWED_SSH_TARGETS.clear()
+    ALLOWED_SSH_TARGETS.update(allowed)
+
+
+async def _ssh_ws_handler(websocket, path=None):
     try:
-        subprocess.Popen(["putty.exe", "-ssh", ip, "-P", port])
-    except FileNotFoundError:
-        st.error("Putty not found. Please install Putty or add putty.exe to PATH.")
+        init_msg = await websocket.recv()
+        try:
+            init = json.loads(init_msg)
+        except Exception:
+            await websocket.send(json.dumps({"type": "error", "message": "Invalid init payload"}))
+            return
+
+        host = (init.get("host") or "").strip()
+        port = int(init.get("port") or 22)
+        username = (init.get("username") or "").strip()
+        password = init.get("password") or ""
+
+        if not host or not username:
+            await websocket.send(json.dumps({"type": "error", "message": "Missing host or username"}))
+            return
+
+        if f"{host}:{port}" not in ALLOWED_SSH_TARGETS:
+            await websocket.send(json.dumps({"type": "error", "message": "Target not allowed"}))
+            return
+
+        try:
+            conn = await asyncssh.connect(
+                host,
+                port=port,
+                username=username,
+                password=password,
+                known_hosts=None,
+                connect_timeout=8,
+                login_timeout=8,
+            )
+        except Exception as exc:
+            await websocket.send(json.dumps({"type": "error", "message": f"SSH connect failed: {exc}"}))
+            return
+
+        async with conn:
+            proc = await conn.create_process(term_type="xterm")
+
+            async def pump_stdout():
+                async for data in proc.stdout:
+                    await websocket.send(json.dumps({"type": "output", "data": data}))
+
+            async def pump_stderr():
+                async for data in proc.stderr:
+                    await websocket.send(json.dumps({"type": "output", "data": data}))
+
+            async def pump_input():
+                async for message in websocket:
+                    try:
+                        payload = json.loads(message)
+                    except Exception:
+                        continue
+                    if payload.get("type") == "input":
+                        proc.stdin.write(payload.get("data", ""))
+                    elif payload.get("type") == "resize":
+                        cols = int(payload.get("cols", 80))
+                        rows = int(payload.get("rows", 24))
+                        proc.change_terminal_size(cols, rows)
+
+            await websocket.send(json.dumps({"type": "status", "message": "connected"}))
+
+            tasks = [
+                asyncio.create_task(pump_stdout()),
+                asyncio.create_task(pump_stderr()),
+                asyncio.create_task(pump_input()),
+            ]
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await proc.wait()
+    except Exception:
+        return
 
 
-def open_rdp(ip: str, port: str):
-    if not ip:
+async def _ssh_ws_serve(port: int):
+    async with websockets.serve(
+        _ssh_ws_handler,
+        "0.0.0.0",
+        port,
+        ping_interval=20,
+        ping_timeout=20,
+    ):
+        SSH_WS_READY.set()
+        await asyncio.Future()
+
+
+def _start_ssh_ws_server_once():
+    global SSH_WS_STARTED, SSH_WS_ERROR
+    if SSH_WS_STARTED or not HAS_SSH_WS:
         return
-    port = _safe_port(port)
-    if not port:
-        st.warning("RDP Port is empty.")
-        return
-    subprocess.Popen(["mstsc.exe", f"/v:{ip}:{port}"])
+    SSH_WS_STARTED = True
+    SSH_WS_READY.clear()
+    SSH_WS_ERROR = None
+
+    def runner():
+        try:
+            asyncio.run(_ssh_ws_serve(SSH_WS_PORT))
+        except Exception as exc:
+            SSH_WS_STARTED = False
+            SSH_WS_ERROR = str(exc)
+            SSH_WS_READY.set()
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
 
 
 def resolve_domain(domain: str) -> str:
@@ -856,9 +993,215 @@ def fetch_avg_rtt(node_id: str, limit: int = 5) -> float:
     return sum(rows) / len(rows)
 
 
+def render_ssh_terminal(host: str, port: str):
+    if not HAS_SSH_WS:
+        st.error("SSH terminal requires 'asyncssh' and 'websockets' packages.")
+        return
+    _start_ssh_ws_server_once()
+    SSH_WS_READY.wait(timeout=2.0)
+    if not SSH_WS_STARTED:
+        msg = SSH_WS_ERROR or "SSH WebSocket server failed to start."
+        st.error(msg)
+        return
+    st.caption(f"SSH WS server: {'ready' if SSH_WS_READY.is_set() else 'starting'} on port {SSH_WS_PORT}")
+    if SSH_WS_ERROR:
+        st.error(f"SSH WS error: {SSH_WS_ERROR}")
+    if st.button("Check WS Port", key=f"check-ws-{host}:{port}"):
+        try:
+            sock = socket.create_connection(("127.0.0.1", SSH_WS_PORT), timeout=1.5)
+            sock.close()
+            st.success("WS port is reachable on localhost.")
+        except Exception as exc:
+            st.error(f"WS port not reachable: {exc}")
+
+    safe_host = host.replace('"', "")
+    safe_port = str(port).replace('"', "")
+    ws_port = SSH_WS_PORT
+    xterm_css = ""
+    xterm_js = ""
+    xterm_fit = ""
+    use_local_xterm = False
+    try:
+        if os.path.isfile(XTERM_CSS_PATH):
+            with open(XTERM_CSS_PATH, "r", encoding="utf-8") as fh:
+                xterm_css = fh.read()
+        if os.path.isfile(XTERM_JS_PATH):
+            with open(XTERM_JS_PATH, "r", encoding="utf-8") as fh:
+                xterm_js = fh.read()
+        if os.path.isfile(XTERM_FIT_PATH):
+            with open(XTERM_FIT_PATH, "r", encoding="utf-8") as fh:
+                xterm_fit = fh.read()
+        use_local_xterm = bool(xterm_css and xterm_js and xterm_fit)
+    except Exception:
+        use_local_xterm = False
+    if use_local_xterm:
+        st.caption("xterm.js loaded from local assets.")
+    else:
+        st.caption("xterm.js local assets not found; using CDN fallback.")
+    html = f"""
+    <div style="border: 1px solid rgba(148,163,184,0.35); border-radius: 12px; padding: 12px; background: rgba(15,23,42,0.7);">
+      <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap: wrap;">
+        <div style="color:#e2e8f0; font-weight:600;">SSH Terminal</div>
+        <div style="color:#94a3b8; font-size:12px;">{safe_host}:{safe_port}</div>
+        <div style="color:#64748b; font-size:11px;">WS port: {ws_port}</div>
+      </div>
+      <div style="display:flex; gap:8px; margin-bottom:8px; flex-wrap: wrap;">
+        <input id="ssh-user" placeholder="Username" style="padding:6px 8px; border-radius:8px; border:1px solid rgba(148,163,184,0.35); background:#0f172a; color:#e2e8f0;" />
+        <input id="ssh-pass" type="password" placeholder="Password" style="padding:6px 8px; border-radius:8px; border:1px solid rgba(148,163,184,0.35); background:#0f172a; color:#e2e8f0;" />
+        <button id="ssh-connect" style="padding:6px 10px; border-radius:8px; border:1px solid rgba(148,163,184,0.35); background:#1e293b; color:#e2e8f0; cursor:pointer;">Connect</button>
+        <span id="ssh-status" style="color:#94a3b8; font-size:12px;"></span>
+      </div>
+      <div id="ssh-debug" style="color:#64748b; font-size:11px; margin-bottom:8px;"></div>
+      <div id="terminal" style="height:420px; border-radius:10px; overflow:hidden;"></div>
+      <div id="plain-terminal-wrap" style="display:none;">
+        <textarea id="plain-terminal" readonly style="width:100%; height:380px; border-radius:10px; border:1px solid rgba(148,163,184,0.35); background:#0b1220; color:#e2e8f0; padding:10px; box-sizing:border-box;"></textarea>
+        <input id="plain-input" placeholder="Type command and press Enter" style="width:100%; margin-top:8px; padding:8px 10px; border-radius:8px; border:1px solid rgba(148,163,184,0.35); background:#0f172a; color:#e2e8f0;" />
+      </div>
+    </div>
+
+    {"<style>" + xterm_css + "</style>" if use_local_xterm else '<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.5.0/css/xterm.css" />'}
+    {"<script>" + xterm_js + "</script>" if use_local_xterm else '<script src="https://cdn.jsdelivr.net/npm/xterm@5.5.0/lib/xterm.js"></script>'}
+    {"<script>" + xterm_fit + "</script>" if use_local_xterm else '<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.9.0/lib/xterm-addon-fit.js"></script>'}
+    <script>
+      const statusEl = document.getElementById('ssh-status');
+      const debugEl = document.getElementById('ssh-debug');
+      function setStatus(text) {{
+        statusEl.textContent = text || "";
+      }}
+      function setDebug(text) {{
+        if (debugEl) debugEl.textContent = text || "";
+      }}
+      const termAvailable = typeof Terminal !== "undefined";
+      const plainWrap = document.getElementById('plain-terminal-wrap');
+      const plainTerm = document.getElementById('plain-terminal');
+      const plainInput = document.getElementById('plain-input');
+      if (!termAvailable) {{
+        setStatus("xterm.js failed to load. Using plain terminal.");
+        document.getElementById('terminal').style.display = "none";
+        plainWrap.style.display = "block";
+      }}
+      const term = termAvailable ? new Terminal({{cursorBlink: true, fontSize: 12}}) : null;
+      const fitAddon = termAvailable ? new FitAddon.FitAddon() : null;
+      if (term) {{
+        term.loadAddon(fitAddon);
+        term.open(document.getElementById('terminal'));
+        fitAddon.fit();
+      }}
+
+      let ws = null;
+      const host = "{safe_host}";
+      const port = "{safe_port}";
+      const wsPort = {ws_port};
+      setDebug("Ready. Click Connect.");
+
+      function sendResize() {{
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (!term) return;
+        fitAddon.fit();
+        ws.send(JSON.stringify({{type: "resize", cols: term.cols, rows: term.rows}}));
+      }}
+
+      document.getElementById('ssh-connect').addEventListener('click', () => {{
+        const username = document.getElementById('ssh-user').value || "";
+        const password = document.getElementById('ssh-pass').value || "";
+        if (!username || !password) {{
+          setStatus("Username/password required.");
+          return;
+        }}
+        const pageProto = (window.parent && window.parent.location && window.parent.location.protocol) || window.location.protocol;
+        const pageHost = (window.parent && window.parent.location && window.parent.location.hostname) || window.location.hostname || "127.0.0.1";
+        const proto = pageProto === "https:" ? "wss" : "ws";
+        const wsUrl = `${{proto}}://${{pageHost}}:${{wsPort}}/ssh`;
+        setStatus("Connecting...");
+        setDebug("WS URL: " + wsUrl);
+        try {{
+          ws = new WebSocket(wsUrl);
+        }} catch (err) {{
+          setStatus("WebSocket init failed.");
+          return;
+        }}
+        const connectTimer = setTimeout(() => {{
+          if (!ws || ws.readyState !== WebSocket.OPEN) {{
+            setStatus("WebSocket timeout. Check firewall for port " + wsPort + ".");
+          }}
+        }}, 3000);
+        ws.onopen = () => {{
+          clearTimeout(connectTimer);
+          ws.send(JSON.stringify({{
+            host: host,
+            port: port,
+            username: username,
+            password: password
+          }}));
+          setStatus("Connected.");
+          sendResize();
+        }};
+        ws.onmessage = (event) => {{
+          let msg = null;
+          try {{ msg = JSON.parse(event.data); }} catch (e) {{}}
+          if (!msg) return;
+          if (msg.type === "output") {{
+            if (term) {{
+              term.write(msg.data);
+            }} else if (plainTerm) {{
+              plainTerm.value += msg.data;
+              plainTerm.scrollTop = plainTerm.scrollHeight;
+            }}
+          }} else if (msg.type === "error") {{
+            setStatus(msg.message || "Error");
+          }}
+        }};
+        ws.onerror = () => {{
+          setStatus("WebSocket error. Check firewall for port " + wsPort + ".");
+        }};
+        ws.onclose = () => {{
+          setStatus("Disconnected.");
+        }};
+        if (term) {{
+          term.onData((data) => {{
+            if (ws && ws.readyState === WebSocket.OPEN) {{
+              ws.send(JSON.stringify({{type: "input", data: data}}));
+            }}
+          }});
+        }}
+        if (plainInput) {{
+          plainInput.addEventListener('keydown', (e) => {{
+            if (e.key === "Enter") {{
+              e.preventDefault();
+              const value = plainInput.value || "";
+              if (value && ws && ws.readyState === WebSocket.OPEN) {{
+                ws.send(JSON.stringify({{type: "input", data: value + "\\n"}}));
+                plainInput.value = "";
+              }}
+            }}
+          }});
+        }}
+      }});
+
+      window.addEventListener('resize', () => {{
+        sendResize();
+      }});
+    </script>
+    """
+    components.html(html, height=520)
+
+
 def run():
     st.header("Network Architecture Diagram")
-    st.caption("SSH requires PuTTY. Web requires a browser. RDP requires Windows RDP tools.")
+    st.caption("SSH requires a registered protocol handler. Web requires a browser. RDP uses Windows RDP tools.")
+    if st.session_state.get("ssh_open") and st.session_state.get("ssh_target"):
+        target = st.session_state.get("ssh_target") or {}
+        host = target.get("host") or ""
+        port = target.get("port") or "22"
+        with st.expander(f"SSH Terminal: {host}:{port}", expanded=True):
+            if st.button("Close SSH Terminal"):
+                st.session_state["ssh_open"] = False
+                st.session_state["ssh_target"] = None
+                if hasattr(st, "rerun"):
+                    st.rerun()
+                else:
+                    st.experimental_rerun()
+            render_ssh_terminal(host, port)
     if not os.path.isdir(COMPONENT_DIR):
         st.error("Missing component: Network Architecture Diagram/components/zabbix_map_component")
         st.info("Restore the component folder to enable the map canvas.")
@@ -868,6 +1211,12 @@ def run():
     # Keep map empty by default; only add nodes manually.
     if "component_key" not in st.session_state:
         st.session_state["component_key"] = 0
+    if "ssh_open" not in st.session_state:
+        st.session_state["ssh_open"] = False
+    if "ssh_target" not in st.session_state:
+        st.session_state["ssh_target"] = None
+    if "ssh_open_notice" not in st.session_state:
+        st.session_state["ssh_open_notice"] = False
 
     with st.sidebar:
         st.subheader("Filters")
@@ -922,6 +1271,7 @@ def run():
     filters = {"site": site, "floor": floor, "line": line}
     nodes = fetch_nodes(filters)
     edges = fetch_edges()
+    update_allowed_ssh_targets(nodes)
 
     if st.session_state.get("run_ping_once"):
         ping_sweep(nodes, load_alert_config())
@@ -992,8 +1342,13 @@ def run():
         node_data=nodes,
         node_types=NODE_TYPES,
         floor_options=FLOOR_OPTIONS,
+        client_action=st.session_state.get("client_action"),
         key=f"zabbix-map-{st.session_state['component_key']}",
     )
+
+    # Debug: show last component event
+    if "last_event_debug" in st.session_state:
+        st.caption(f"Last event: {st.session_state['last_event_debug']}")
 
     node_ids = [n["id"] for n in nodes]
     selected_pos = None
@@ -1133,6 +1488,7 @@ def run():
             edge_id = f"e-{int(time.time() * 1000)}"
             upsert_edge({"id": edge_id, "source": source_id, "target": target_id, "status": "unknown"})
     elif isinstance(event, dict) and event.get("event") in {"open_web", "open_ssh", "open_rdp"}:
+        st.session_state["last_event_debug"] = event
         ev_ts = event.get("ts")
         if ev_ts is not None and last_ts_map.get(event.get("event")) == ev_ts:
             return
@@ -1145,11 +1501,38 @@ def run():
             if target:
                 ip = target.get("ip") or ""
                 if event.get("event") == "open_web":
-                    open_web(ip, target.get("web_port", ""))
+                    enqueued = enqueue_client_action("web", ip, target.get("web_port", ""))
                 elif event.get("event") == "open_ssh":
-                    open_ssh(ip, target.get("ssh_port", ""))
+                    was_open = st.session_state.get("ssh_open", False)
+                    prev_target = st.session_state.get("ssh_target")
+                    ssh_port = (target.get("ssh_port", "") or "").strip()
+                    if ssh_port:
+                        new_target = {"host": ip, "port": ssh_port}
+                        st.session_state["ssh_target"] = new_target
+                        st.session_state["ssh_open"] = True
+                        st.session_state["ssh_open_notice"] = True
+                        enqueued = False
+                        if (not was_open) or (prev_target != new_target):
+                            if hasattr(st, "rerun"):
+                                st.rerun()
+                            else:
+                                st.experimental_rerun()
+                    else:
+                        enqueued = enqueue_client_action("ssh", ip, target.get("ssh_port", ""))
                 elif event.get("event") == "open_rdp":
-                    open_rdp(ip, target.get("rdp_port", ""))
+                    enqueued = enqueue_client_action("rdp", ip, target.get("rdp_port", ""))
+                else:
+                    enqueued = False
+                if enqueued:
+                    if hasattr(st, "rerun"):
+                        st.rerun()
+                    else:
+                        st.experimental_rerun()
+    elif isinstance(event, dict) and event.get("event") == "client_action_done":
+        done_ts = event.get("ts")
+        current = st.session_state.get("client_action") or {}
+        if done_ts and current.get("ts") == done_ts:
+            st.session_state["client_action"] = None
     if selected_pos and selected_pos.get("x") is not None and selected_pos.get("y") is not None:
         pos_x = float(selected_pos["x"])
         pos_y = float(selected_pos["y"])
@@ -1164,11 +1547,19 @@ def run():
         if node_id and size.get("w") and size.get("h"):
             update_node_size(node_id, float(size["w"]), float(size["h"]))
 
+    if st.session_state.get("ssh_open_notice"):
+        st.session_state["ssh_open_notice"] = False
+        if hasattr(st, "toast"):
+            st.toast("SSH terminal opened below. Scroll down to use it.")
+        else:
+            st.info("SSH terminal opened below. Scroll down to use it.")
+
     st.divider()
+    action_note = st.session_state.get("client_action_note")
+    if action_note:
+        st.info(action_note)
+        st.session_state["client_action_note"] = ""
 
-
-
-    st.divider()
     with st.expander("Alert", expanded=False):
         alert_cfg = load_alert_config()
         down_threshold = st.number_input("Down threshold (N)", min_value=1, max_value=20, value=max(1, alert_cfg["down_threshold"]))

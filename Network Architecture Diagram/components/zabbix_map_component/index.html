@@ -313,6 +313,7 @@
       let nodePositions = {};
       let nodeSizes = {};
       let lastNodes = [];
+      let lastClientActionTs = null;
       const defaultNodeSize = { w: 170, h: 92 };
       const minNodeSize = { w: 120, h: 68 };
       const maxNodeSize = { w: 320, h: 200 };
@@ -658,6 +659,18 @@
           (document.getElementById("hint").offsetHeight || 0) +
           24;
         setFrameHeight(totalHeight);
+
+        const action = lastArgs.client_action;
+        if (action && action.ts && action.ts !== lastClientActionTs) {
+          lastClientActionTs = action.ts;
+          if (action.type === "open_url" && action.url) {
+            const opened = window.open(action.url, "_blank", "noopener");
+            if (!opened) {
+              alert(`Pop-up blocked. Open manually: ${action.url}`);
+            }
+          }
+          setComponentValue({ event: "client_action_done", ts: action.ts });
+        }
       }
 
       document.getElementById("canvas").addEventListener("dragover", (event) => {
@@ -834,12 +847,7 @@
         if (action === "edit") {
           openEdit(contextNodeId);
         } else if (action === "open_web") {
-          const port = node ? String(node.web_port || "").trim() : "";
-          if (!port) {
-            alert("Please fill Web Port first.");
-            return;
-          }
-          setComponentValue({ event: "open_web", node_id: contextNodeId, ts: Date.now() });
+          openClientUrl("web", node);
         } else if (action === "open_ssh") {
           const port = node ? String(node.ssh_port || "").trim() : "";
           if (!port) {
@@ -848,12 +856,7 @@
           }
           setComponentValue({ event: "open_ssh", node_id: contextNodeId, ts: Date.now() });
         } else if (action === "open_rdp") {
-          const port = node ? String(node.rdp_port || "").trim() : "";
-          if (!port) {
-            alert("Please fill RDP Port first.");
-            return;
-          }
-          setComponentValue({ event: "open_rdp", node_id: contextNodeId, ts: Date.now() });
+          openClientUrl("rdp", node);
         } else if (action === "delete") {
           openDelete(contextNodeId);
         }
@@ -869,6 +872,36 @@
       function getNodeDataById(nodeId) {
         const list = lastArgs.node_data || [];
         return list.find((node) => node.id === nodeId);
+      }
+
+      function openClientUrl(kind, node) {
+        if (!node) {
+          alert("Node data missing.");
+          return;
+        }
+        const ip = String(node.ip || "").trim();
+        if (!ip) {
+          alert("IP is empty.");
+          return;
+        }
+        let port = "";
+        if (kind === "web") port = String(node.web_port || "").trim();
+        if (kind === "ssh") port = String(node.ssh_port || "").trim();
+        if (kind === "rdp") port = String(node.rdp_port || "").trim();
+        if (!port) {
+          alert(`Please fill ${kind.toUpperCase()} Port first.`);
+          return;
+        }
+        let url = "";
+        if (kind === "web") {
+          const scheme = port === "443" || port === "8443" ? "https" : "http";
+          url = `${scheme}://${ip}:${port}`;
+        } else if (kind === "ssh") {
+          url = `ssh://${ip}:${port}`;
+        } else if (kind === "rdp") {
+          url = `ms-rdp://full%20address=s:${ip}:${port}`;
+        }
+        window.open(url, "_blank", "noopener");
       }
 
       function populateSelect(selectEl, options, current) {
