@@ -10,11 +10,8 @@
 <br> ps -ef | grep streamlit | grep -v grep <br>
 
 - Firewall rules
-<br> Web ui <br>
 <br> sudo firewall-cmd --add-port=8500/tcp --permanent <br>
-<br> WebSocket <br>
 <br> sudo firewall-cmd --add-port=8765/tcp --permanent <br>
-<br> Restart the firewall <br>
 <br> sudo firewall-cmd --reload <br>
 
 #=== IE Optical Fiber Health ====
