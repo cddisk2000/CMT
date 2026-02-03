@@ -493,7 +493,7 @@ async def _ssh_ws_handler(websocket, path=None):
             return
 
         async with conn:
-            proc = await conn.create_process(term_type="xterm")
+            proc = await conn.create_process(term_type="xterm", term_size=(80, 24))
 
             async def pump_stdout():
                 async for data in proc.stdout:
@@ -1003,16 +1003,8 @@ def render_ssh_terminal(host: str, port: str):
         msg = SSH_WS_ERROR or "SSH WebSocket server failed to start."
         st.error(msg)
         return
-    st.caption(f"SSH WS server: {'ready' if SSH_WS_READY.is_set() else 'starting'} on port {SSH_WS_PORT}")
     if SSH_WS_ERROR:
         st.error(f"SSH WS error: {SSH_WS_ERROR}")
-    if st.button("Check WS Port", key=f"check-ws-{host}:{port}"):
-        try:
-            sock = socket.create_connection(("127.0.0.1", SSH_WS_PORT), timeout=1.5)
-            sock.close()
-            st.success("WS port is reachable on localhost.")
-        except Exception as exc:
-            st.error(f"WS port not reachable: {exc}")
 
     safe_host = host.replace('"', "")
     safe_port = str(port).replace('"', "")
@@ -1034,21 +1026,21 @@ def render_ssh_terminal(host: str, port: str):
         use_local_xterm = bool(xterm_css and xterm_js and xterm_fit)
     except Exception:
         use_local_xterm = False
-    if use_local_xterm:
-        st.caption("xterm.js loaded from local assets.")
-    else:
-        st.caption("xterm.js local assets not found; using CDN fallback.")
+    # Hide xterm.js loading debug info.
     html = f"""
     <div style="border: 1px solid rgba(148,163,184,0.35); border-radius: 12px; padding: 12px; background: rgba(15,23,42,0.7);">
       <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap: wrap;">
         <div style="color:#e2e8f0; font-weight:600;">SSH Terminal</div>
         <div style="color:#94a3b8; font-size:12px;">{safe_host}:{safe_port}</div>
-        <div style="color:#64748b; font-size:11px;">WS port: {ws_port}</div>
       </div>
-      <div style="display:flex; gap:8px; margin-bottom:8px; flex-wrap: wrap;">
+      <div style="display:flex; gap:8px; margin-bottom:8px; flex-wrap: wrap; align-items:center;">
         <input id="ssh-user" placeholder="Username" style="padding:6px 8px; border-radius:8px; border:1px solid rgba(148,163,184,0.35); background:#0f172a; color:#e2e8f0;" />
         <input id="ssh-pass" type="password" placeholder="Password" style="padding:6px 8px; border-radius:8px; border:1px solid rgba(148,163,184,0.35); background:#0f172a; color:#e2e8f0;" />
         <button id="ssh-connect" style="padding:6px 10px; border-radius:8px; border:1px solid rgba(148,163,184,0.35); background:#1e293b; color:#e2e8f0; cursor:pointer;">Connect</button>
+        <label style="display:flex; align-items:center; gap:6px; color:#94a3b8; font-size:12px;">
+          <input id="local-echo" type="checkbox" checked style="accent-color:#38bdf8;" />
+          Local echo
+        </label>
         <span id="ssh-status" style="color:#94a3b8; font-size:12px;"></span>
       </div>
       <div id="ssh-debug" style="color:#64748b; font-size:11px; margin-bottom:8px;"></div>
@@ -1075,24 +1067,79 @@ def render_ssh_terminal(host: str, port: str):
       const plainWrap = document.getElementById('plain-terminal-wrap');
       const plainTerm = document.getElementById('plain-terminal');
       const plainInput = document.getElementById('plain-input');
+      const localEchoEl = document.getElementById('local-echo');
+      let localEcho = localEchoEl ? localEchoEl.checked : true;
+      const echoQueue = [];
+      const MAX_ECHO_QUEUE = 30;
+      if (localEchoEl) {{
+        localEchoEl.addEventListener('change', () => {{
+          localEcho = localEchoEl.checked;
+        }});
+      }}
       if (!termAvailable) {{
         setStatus("xterm.js failed to load. Using plain terminal.");
         document.getElementById('terminal').style.display = "none";
         plainWrap.style.display = "block";
       }}
-      const term = termAvailable ? new Terminal({{cursorBlink: true, fontSize: 12}}) : null;
+      const term = termAvailable ? new Terminal({{cursorBlink: true, fontSize: 12, convertEol: true, scrollback: 2000}}) : null;
       const fitAddon = termAvailable ? new FitAddon.FitAddon() : null;
       if (term) {{
         term.loadAddon(fitAddon);
-        term.open(document.getElementById('terminal'));
+        const termHost = document.getElementById('terminal');
+        term.open(termHost);
         fitAddon.fit();
+        term.focus();
+        termHost.addEventListener('mousedown', () => {{
+          term.focus();
+        }});
       }}
 
       let ws = null;
+      let lastWsError = "";
       const host = "{safe_host}";
       const port = "{safe_port}";
       const wsPort = {ws_port};
       setDebug("Ready. Click Connect.");
+
+      function isPrintable(data) {{
+        return /^[\x20-\x7E]+$/.test(data);
+      }}
+
+      function handleLocalEcho(data) {{
+        if (!term || !localEcho || !data) return;
+        // Handle backspace locally so user can delete before server echo arrives.
+        if (data === "\u007f" || data === "\b") {{
+          term.write("\b \b");
+          return;
+        }}
+        if (isPrintable(data)) {{
+          term.write(data);
+          enqueueEcho(data);
+        }}
+      }}
+
+      function enqueueEcho(data) {{
+        if (!data) return;
+        echoQueue.push(data);
+        if (echoQueue.length > MAX_ECHO_QUEUE) {{
+          echoQueue.shift();
+        }}
+      }}
+
+      function consumeEcho(data) {{
+        if (!echoQueue.length) return data;
+        const next = echoQueue[0] || "";
+        if (!next) return data;
+        if (data === next) {{
+          echoQueue.shift();
+          return "";
+        }}
+        if (data.startsWith(next)) {{
+          echoQueue.shift();
+          return data.slice(next.length);
+        }}
+        return data;
+      }}
 
       function sendResize() {{
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -1135,30 +1182,45 @@ def render_ssh_terminal(host: str, port: str):
           }}));
           setStatus("Connected.");
           sendResize();
+          if (term) {{
+            term.focus();
+          }}
         }};
         ws.onmessage = (event) => {{
           let msg = null;
           try {{ msg = JSON.parse(event.data); }} catch (e) {{}}
           if (!msg) return;
           if (msg.type === "output") {{
+            const output = localEcho ? consumeEcho(msg.data || "") : (msg.data || "");
+            if (!output) return;
             if (term) {{
-              term.write(msg.data);
+              term.write(output);
+              term.scrollToBottom();
             }} else if (plainTerm) {{
-              plainTerm.value += msg.data;
+              plainTerm.value += output;
               plainTerm.scrollTop = plainTerm.scrollHeight;
             }}
           }} else if (msg.type === "error") {{
-            setStatus(msg.message || "Error");
+            lastWsError = msg.message || "Error";
+            setStatus(lastWsError);
           }}
         }};
         ws.onerror = () => {{
-          setStatus("WebSocket error. Check firewall for port " + wsPort + ".");
+          lastWsError = "WebSocket error. Check firewall for port " + wsPort + ".";
+          setStatus(lastWsError);
         }};
-        ws.onclose = () => {{
-          setStatus("Disconnected.");
+        ws.onclose = (event) => {{
+          if (lastWsError) {{
+            setStatus("Disconnected: " + lastWsError);
+          }} else if (event && event.code) {{
+            setStatus("Disconnected. Code " + event.code + (event.reason ? (": " + event.reason) : ""));
+          }} else {{
+            setStatus("Disconnected.");
+          }}
         }};
         if (term) {{
           term.onData((data) => {{
+            handleLocalEcho(data);
             if (ws && ws.readyState === WebSocket.OPEN) {{
               ws.send(JSON.stringify({{type: "input", data: data}}));
             }}
@@ -1346,9 +1408,7 @@ def run():
         key=f"zabbix-map-{st.session_state['component_key']}",
     )
 
-    # Debug: show last component event
-    if "last_event_debug" in st.session_state:
-        st.caption(f"Last event: {st.session_state['last_event_debug']}")
+    # Hide last component event debug text.
 
     node_ids = [n["id"] for n in nodes]
     selected_pos = None
@@ -1488,7 +1548,6 @@ def run():
             edge_id = f"e-{int(time.time() * 1000)}"
             upsert_edge({"id": edge_id, "source": source_id, "target": target_id, "status": "unknown"})
     elif isinstance(event, dict) and event.get("event") in {"open_web", "open_ssh", "open_rdp"}:
-        st.session_state["last_event_debug"] = event
         ev_ts = event.get("ts")
         if ev_ts is not None and last_ts_map.get(event.get("event")) == ev_ts:
             return
@@ -1549,10 +1608,6 @@ def run():
 
     if st.session_state.get("ssh_open_notice"):
         st.session_state["ssh_open_notice"] = False
-        if hasattr(st, "toast"):
-            st.toast("SSH terminal opened below. Scroll down to use it.")
-        else:
-            st.info("SSH terminal opened below. Scroll down to use it.")
 
     st.divider()
     action_note = st.session_state.get("client_action_note")
