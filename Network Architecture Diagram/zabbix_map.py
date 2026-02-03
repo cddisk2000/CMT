@@ -7,12 +7,14 @@ import json
 import sqlite3
 import socket
 import time
+import webbrowser
 from typing import Dict, List, Tuple
 
 import streamlit as st
 import streamlit.components.v1 as components
 
 from Alert.wx_webhook import send_webhook
+from Alert.psuhplus_webhook import send_pushplus_webhook
 from Alert.e_mail import send_email
 
 try:
@@ -93,6 +95,9 @@ def ensure_db():
             line TEXT,
             pos_x REAL,
             pos_y REAL,
+            web_port TEXT,
+            ssh_port TEXT,
+            rdp_port TEXT,
             last_status TEXT,
             last_rtt_ms REAL,
             last_loss REAL,
@@ -107,6 +112,12 @@ def ensure_db():
         cur.execute("ALTER TABLE nodes ADD COLUMN size_w REAL")
     if "size_h" not in cols:
         cur.execute("ALTER TABLE nodes ADD COLUMN size_h REAL")
+    if "web_port" not in cols:
+        cur.execute("ALTER TABLE nodes ADD COLUMN web_port TEXT")
+    if "ssh_port" not in cols:
+        cur.execute("ALTER TABLE nodes ADD COLUMN ssh_port TEXT")
+    if "rdp_port" not in cols:
+        cur.execute("ALTER TABLE nodes ADD COLUMN rdp_port TEXT")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS edges (
@@ -144,6 +155,7 @@ def ensure_db():
             down_threshold INTEGER NOT NULL,
             cooldown_sec INTEGER NOT NULL,
             webhook_url TEXT,
+            webhook_type TEXT,
             email_to TEXT,
             email_from TEXT,
             smtp_host TEXT,
@@ -161,15 +173,26 @@ def ensure_db():
         )
         """
     )
+    cur.execute("PRAGMA table_info(alert_config)")
+    alert_cols = {row[1] for row in cur.fetchall()}
+    if "webhook_type" not in alert_cols:
+        cur.execute("ALTER TABLE alert_config ADD COLUMN webhook_type TEXT")
     cur.execute("SELECT COUNT(*) FROM alert_config")
     if cur.fetchone()[0] == 0:
         cur.execute(
             """
             INSERT INTO alert_config
-            (id, down_threshold, cooldown_sec, webhook_url)
-            VALUES (1, 3, 300, '')
+            (id, down_threshold, cooldown_sec, webhook_url, webhook_type)
+            VALUES (1, 3, 300, '', 'wx')
             """
         )
+    cur.execute(
+        """
+        UPDATE alert_config
+        SET webhook_type = 'wx'
+        WHERE webhook_type IS NULL OR webhook_type = ''
+        """
+    )
     cur.execute("SELECT COUNT(*) FROM settings WHERE key = 'ping_retention_days'")
     if cur.fetchone()[0] == 0:
         cur.execute(
@@ -263,8 +286,8 @@ def upsert_node(node: Dict):
     cur.execute(
         """
         INSERT INTO nodes
-        (id, name, ip, node_type, site, floor, line, pos_x, pos_y, size_w, size_h, last_status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, name, ip, node_type, site, floor, line, pos_x, pos_y, size_w, size_h, web_port, ssh_port, rdp_port, last_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             name=excluded.name,
             ip=excluded.ip,
@@ -275,7 +298,10 @@ def upsert_node(node: Dict):
             pos_x=excluded.pos_x,
             pos_y=excluded.pos_y,
             size_w=excluded.size_w,
-            size_h=excluded.size_h
+            size_h=excluded.size_h,
+            web_port=excluded.web_port,
+            ssh_port=excluded.ssh_port,
+            rdp_port=excluded.rdp_port
         """,
         (
             node["id"],
@@ -289,6 +315,9 @@ def upsert_node(node: Dict):
             node.get("pos_y", 0),
             node.get("size_w"),
             node.get("size_h"),
+            (node.get("web_port") or "").strip(),
+            (node.get("ssh_port") or "").strip(),
+            (node.get("rdp_port") or "").strip(),
             node.get("last_status", "unknown"),
         ),
     )
@@ -339,6 +368,62 @@ def update_node_ip(node_id: str, ip: str):
     )
     conn.commit()
     conn.close()
+
+
+def update_node_ports(node_id: str, web_port: str = None, ssh_port: str = None, rdp_port: str = None):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    if web_port is not None:
+        cur.execute("UPDATE nodes SET web_port=? WHERE id=?", (web_port, node_id))
+    if ssh_port is not None:
+        cur.execute("UPDATE nodes SET ssh_port=? WHERE id=?", (ssh_port, node_id))
+    if rdp_port is not None:
+        cur.execute("UPDATE nodes SET rdp_port=? WHERE id=?", (rdp_port, node_id))
+    conn.commit()
+    conn.close()
+
+
+def _safe_port(value: str) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    return text
+
+
+def open_web(ip: str, port: str):
+    if not ip:
+        return
+    port = _safe_port(port)
+    if not port:
+        st.warning("Web Port is empty.")
+        return
+    url = f"http://{ip}:{port}"
+    webbrowser.open(url)
+
+
+def open_ssh(ip: str, port: str):
+    if not ip:
+        return
+    port = _safe_port(port)
+    if not port:
+        st.warning("SSH Port is empty.")
+        return
+    try:
+        subprocess.Popen(["putty.exe", "-ssh", ip, "-P", port])
+    except FileNotFoundError:
+        st.error("Putty not found. Please install Putty or add putty.exe to PATH.")
+
+
+def open_rdp(ip: str, port: str):
+    if not ip:
+        return
+    port = _safe_port(port)
+    if not port:
+        st.warning("RDP Port is empty.")
+        return
+    subprocess.Popen(["mstsc.exe", f"/v:{ip}:{port}"])
 
 
 def resolve_domain(domain: str) -> str:
@@ -452,6 +537,14 @@ def update_alert_state(node_id: str, is_down: bool, threshold: int, cooldown: in
     return should_alert, down_count, recovered
 
 
+def send_alert_webhook(alert_cfg: Dict, payload: dict):
+    webhook_type = (alert_cfg.get("webhook_type") or "wx").lower()
+    url_or_token = alert_cfg.get("webhook_url", "")
+    if webhook_type == "pushplus":
+        return send_pushplus_webhook(url_or_token, payload)
+    return send_webhook(url_or_token, payload)
+
+
 def load_alert_config() -> Dict:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -459,6 +552,8 @@ def load_alert_config() -> Dict:
     cur.execute("SELECT * FROM alert_config WHERE id = 1")
     row = dict(cur.fetchone())
     conn.close()
+    if not row.get("webhook_type"):
+        row["webhook_type"] = "wx"
     return row
 
 
@@ -468,7 +563,7 @@ def save_alert_config(cfg: Dict):
     cur.execute(
         """
         UPDATE alert_config
-        SET down_threshold=?, cooldown_sec=?, webhook_url=?, email_to=?, email_from=?,
+        SET down_threshold=?, cooldown_sec=?, webhook_url=?, webhook_type=?, email_to=?, email_from=?,
             smtp_host=?, smtp_port=?, smtp_user=?, smtp_pass=?
         WHERE id = 1
         """,
@@ -476,6 +571,7 @@ def save_alert_config(cfg: Dict):
             cfg["down_threshold"],
             cfg["cooldown_sec"],
             cfg.get("webhook_url", ""),
+            cfg.get("webhook_type", "wx"),
             cfg.get("email_to", ""),
             cfg.get("email_from", ""),
             cfg.get("smtp_host", ""),
@@ -527,6 +623,17 @@ def clear_all_ping_samples():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("DELETE FROM ping_samples")
+    conn.commit()
+    conn.close()
+
+
+def clear_all_db_data():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM edges")
+    cur.execute("DELETE FROM nodes")
+    cur.execute("DELETE FROM ping_samples")
+    cur.execute("DELETE FROM alert_state")
     conn.commit()
     conn.close()
 
@@ -685,7 +792,7 @@ def ping_sweep(nodes: List[Dict], alert_cfg: Dict):
                 "rtt_ms": rtt_val,
                 "loss": loss,
             }
-            send_webhook(alert_cfg.get("webhook_url", ""), payload)
+            send_alert_webhook(alert_cfg, payload)
             send_email(
                 alert_cfg,
                 subject=f"[Zabbix Map] {node['name']} down",
@@ -703,7 +810,7 @@ def ping_sweep(nodes: List[Dict], alert_cfg: Dict):
                 "rtt_ms": rtt_val,
                 "loss": loss,
             }
-            send_webhook(alert_cfg.get("webhook_url", ""), payload)
+            send_alert_webhook(alert_cfg, payload)
             send_email(
                 alert_cfg,
                 subject=f"[Zabbix Map] {node['name']} recovered",
@@ -751,6 +858,7 @@ def fetch_avg_rtt(node_id: str, limit: int = 5) -> float:
 
 def run():
     st.header("Network Architecture Diagram")
+    st.caption("SSH requires PuTTY. Web requires a browser. RDP requires Windows RDP tools.")
     if not os.path.isdir(COMPONENT_DIR):
         st.error("Missing component: Network Architecture Diagram/components/zabbix_map_component")
         st.info("Restore the component folder to enable the map canvas.")
@@ -805,6 +913,11 @@ def run():
             if st.button("Clear ping data"):
                 clear_all_ping_samples()
                 st.success("Ping data cleared")
+        st.divider()
+        st.subheader("Database")
+        if st.button("Clear all DB data"):
+            clear_all_db_data()
+            st.success("All DB data cleared")
 
     filters = {"site": site, "floor": floor, "line": line}
     nodes = fetch_nodes(filters)
@@ -913,9 +1026,29 @@ def run():
                         "pos_y": target.get("pos_y", 0),
                         "size_w": target.get("size_w"),
                         "size_h": target.get("size_h"),
+                        "web_port": target.get("web_port", ""),
+                        "ssh_port": target.get("ssh_port", ""),
+                        "rdp_port": target.get("rdp_port", ""),
                         "last_status": target.get("last_status", "unknown"),
                     }
                 )
+                port_service = (event.get("port_service") or "").strip().lower()
+                port_value = (event.get("port_value") or "").strip()
+                if port_service in {"web", "ssh", "rdp"}:
+                    if port_service == "web":
+                        update_node_ports(edit_id, web_port=port_value)
+                    elif port_service == "ssh":
+                        update_node_ports(edit_id, ssh_port=port_value)
+                    elif port_service == "rdp":
+                        update_node_ports(edit_id, rdp_port=port_value)
+                else:
+                    # Backward compatibility if fields are still sent.
+                    update_node_ports(
+                        edit_id,
+                        web_port=(event.get("web_port") or "").strip(),
+                        ssh_port=(event.get("ssh_port") or "").strip(),
+                        rdp_port=(event.get("rdp_port") or "").strip(),
+                    )
         st.session_state["page"] = "zabbix_map"
         st.session_state["component_key"] += 1
         st.rerun()
@@ -946,9 +1079,21 @@ def run():
                 "pos_y": pos.get("y", 100),
                 "size_w": event.get("size_w"),
                 "size_h": event.get("size_h"),
+                "web_port": "",
+                "ssh_port": "",
+                "rdp_port": "",
                 "last_status": "unknown",
             }
         )
+        port_service = (event.get("port_service") or "").strip().lower()
+        port_value = (event.get("port_value") or "").strip()
+        if port_service in {"web", "ssh", "rdp"}:
+            if port_service == "web":
+                update_node_ports(new_id, web_port=port_value)
+            elif port_service == "ssh":
+                update_node_ports(new_id, ssh_port=port_value)
+            elif port_service == "rdp":
+                update_node_ports(new_id, rdp_port=port_value)
         st.session_state["page"] = "zabbix_map"
         st.session_state["component_key"] += 1
         st.rerun()
@@ -987,6 +1132,24 @@ def run():
         if source_id and target_id and source_id != target_id:
             edge_id = f"e-{int(time.time() * 1000)}"
             upsert_edge({"id": edge_id, "source": source_id, "target": target_id, "status": "unknown"})
+    elif isinstance(event, dict) and event.get("event") in {"open_web", "open_ssh", "open_rdp"}:
+        ev_ts = event.get("ts")
+        if ev_ts is not None and last_ts_map.get(event.get("event")) == ev_ts:
+            return
+        if ev_ts is not None:
+            last_ts_map[event.get("event")] = ev_ts
+            st.session_state["last_event_ts"] = last_ts_map
+        target_id = event.get("node_id")
+        if target_id:
+            target = next((n for n in nodes if n["id"] == target_id), None)
+            if target:
+                ip = target.get("ip") or ""
+                if event.get("event") == "open_web":
+                    open_web(ip, target.get("web_port", ""))
+                elif event.get("event") == "open_ssh":
+                    open_ssh(ip, target.get("ssh_port", ""))
+                elif event.get("event") == "open_rdp":
+                    open_rdp(ip, target.get("rdp_port", ""))
     if selected_pos and selected_pos.get("x") is not None and selected_pos.get("y") is not None:
         pos_x = float(selected_pos["x"])
         pos_y = float(selected_pos["y"])
@@ -1011,7 +1174,15 @@ def run():
         down_threshold = st.number_input("Down threshold (N)", min_value=1, max_value=20, value=max(1, alert_cfg["down_threshold"]))
         cooldown_sec = st.number_input("Cooldown (sec)", min_value=60, max_value=3600, value=alert_cfg["cooldown_sec"])
         st.caption("Cooldown = same node alert minimum interval (after a trigger, wait this long before next alert).")
-        webhook_url = st.text_input("Webhook URL", value=alert_cfg.get("webhook_url", ""))
+        webhook_type_options = [("WeCom", "wx"), ("PushPlus", "pushplus")]
+        webhook_type_labels = [item[0] for item in webhook_type_options]
+        webhook_type_values = [item[1] for item in webhook_type_options]
+        current_webhook_type = alert_cfg.get("webhook_type", "wx")
+        webhook_type_index = webhook_type_values.index(current_webhook_type) if current_webhook_type in webhook_type_values else 0
+        webhook_type_label = st.selectbox("Webhook Type", webhook_type_labels, index=webhook_type_index)
+        webhook_type = webhook_type_values[webhook_type_labels.index(webhook_type_label)]
+        webhook_label = "Webhook URL" if webhook_type == "wx" else "PushPlus token or URL"
+        webhook_url = st.text_input(webhook_label, value=alert_cfg.get("webhook_url", ""))
         email_to = st.text_input("Email to", value=alert_cfg.get("email_to", ""))
         email_from = st.text_input("Email from", value=alert_cfg.get("email_from", ""))
         smtp_host = st.text_input("SMTP host", value=alert_cfg.get("smtp_host", ""))
@@ -1032,6 +1203,7 @@ def run():
                     "down_threshold": max(1, int(down_threshold)),
                     "cooldown_sec": int(cooldown_sec),
                     "webhook_url": webhook_url,
+                    "webhook_type": webhook_type,
                     "email_to": email_to,
                     "email_from": email_from,
                     "smtp_host": smtp_host,
@@ -1045,8 +1217,8 @@ def run():
             url = webhook_url.strip() if webhook_url else ""
             if url:
                 st.caption(f"URL: {url}")
-            result = send_webhook(
-                url,
+            result = send_alert_webhook(
+                {"webhook_url": url, "webhook_type": webhook_type},
                 {
                     "test": True,
                     "content": "Webhook test from Cisco Maintain Tools",

@@ -197,6 +197,7 @@
       .modal-body select,
       .modal-body textarea {
         width: 100%;
+        box-sizing: border-box;
         padding: 8px 10px;
         border-radius: 10px;
         border: 1px solid rgba(148, 163, 184, 0.35);
@@ -252,6 +253,9 @@
     </div>
     <div id="context-menu">
       <button data-action="edit">Edit</button>
+      <button data-action="open_web">Web</button>
+      <button data-action="open_ssh">SSH</button>
+      <button data-action="open_rdp">RDP</button>
       <button data-action="delete">Delete</button>
     </div>
     <div id="overlay">
@@ -274,6 +278,16 @@
           <div id="ip-row">
             <label for="edit-ip">IP</label>
             <input id="edit-ip" type="text" />
+          </div>
+          <div id="port-row">
+            <label for="edit-port-service">Service</label>
+            <select id="edit-port-service">
+              <option value="web">Web</option>
+              <option value="ssh">SSH</option>
+              <option value="rdp">RDP</option>
+            </select>
+            <label for="edit-port-value">Port</label>
+            <input id="edit-port-value" type="text" placeholder="80 / 443 / 22 / 3389" />
           </div>
           <label for="edit-floor">Floor</label>
           <select id="edit-floor"></select>
@@ -784,6 +798,28 @@
         menu.style.left = x + "px";
         menu.style.top = y + "px";
         menu.style.display = "flex";
+        const openButtons = document.querySelectorAll("[data-action='open_web'], [data-action='open_ssh'], [data-action='open_rdp']");
+        if (openButtons && contextNodeId) {
+          const node = getNodeDataById(contextNodeId);
+          const typeValue = node ? String(node.node_type || "") : "";
+          const hideAll = typeValue === "domain" || typeValue === "cloud" || typeValue === "cloud_vps";
+          openButtons.forEach((btn) => {
+            if (hideAll || !node) {
+              btn.style.display = "none";
+              return;
+            }
+            const action = btn.dataset.action || "";
+            if (action === "open_web") {
+              btn.style.display = String(node.web_port || "").trim() ? "inline-block" : "none";
+            } else if (action === "open_ssh") {
+              btn.style.display = String(node.ssh_port || "").trim() ? "inline-block" : "none";
+            } else if (action === "open_rdp") {
+              btn.style.display = String(node.rdp_port || "").trim() ? "inline-block" : "none";
+            } else {
+              btn.style.display = "none";
+            }
+          });
+        }
       }
 
       function hideContextMenu() {
@@ -794,8 +830,30 @@
       document.getElementById("context-menu").addEventListener("click", (event) => {
         const action = event.target && event.target.dataset ? event.target.dataset.action : null;
         if (!action || !contextNodeId) return;
+        const node = getNodeDataById(contextNodeId);
         if (action === "edit") {
           openEdit(contextNodeId);
+        } else if (action === "open_web") {
+          const port = node ? String(node.web_port || "").trim() : "";
+          if (!port) {
+            alert("Please fill Web Port first.");
+            return;
+          }
+          setComponentValue({ event: "open_web", node_id: contextNodeId, ts: Date.now() });
+        } else if (action === "open_ssh") {
+          const port = node ? String(node.ssh_port || "").trim() : "";
+          if (!port) {
+            alert("Please fill SSH Port first.");
+            return;
+          }
+          setComponentValue({ event: "open_ssh", node_id: contextNodeId, ts: Date.now() });
+        } else if (action === "open_rdp") {
+          const port = node ? String(node.rdp_port || "").trim() : "";
+          if (!port) {
+            alert("Please fill RDP Port first.");
+            return;
+          }
+          setComponentValue({ event: "open_rdp", node_id: contextNodeId, ts: Date.now() });
         } else if (action === "delete") {
           openDelete(contextNodeId);
         }
@@ -851,11 +909,14 @@
         const nameLabel = document.getElementById("name-label");
         const nameRow = document.getElementById("name-row");
         const textRow = document.getElementById("text-row");
+        const portRow = document.getElementById("port-row");
+        const hidePorts = typeValue === "domain" || typeValue === "cloud" || typeValue === "cloud_vps";
         if (typeValue === "domain") {
           ipRow.style.display = "none";
           nameLabel.textContent = "Domain";
           nameRow.style.display = "block";
           textRow.style.display = "none";
+          portRow.style.display = hidePorts ? "none" : "block";
         } else {
           nameLabel.textContent = "Name";
           if (typeValue === "text") {
@@ -863,10 +924,12 @@
             textRow.style.display = "block";
             nameRow.style.display = "none";
             nameLabel.textContent = "Text";
+            portRow.style.display = "none";
           } else {
             ipRow.style.display = "block";
             textRow.style.display = "none";
             nameRow.style.display = "block";
+            portRow.style.display = hidePorts ? "none" : "block";
           }
         }
       }
@@ -879,6 +942,21 @@
         return document.getElementById("edit-name").value;
       }
 
+      function getPortValueByService(node, service) {
+        if (!node) return "";
+        if (service === "ssh") return node.ssh_port || "";
+        if (service === "rdp") return node.rdp_port || "";
+        return node.web_port || "";
+      }
+
+      function syncPortValueFromService(node) {
+        const serviceSelect = document.getElementById("edit-port-service");
+        const portInput = document.getElementById("edit-port-value");
+        if (!serviceSelect || !portInput) return;
+        const service = serviceSelect.value || "web";
+        portInput.value = getPortValueByService(node, service);
+      }
+
       function openEdit(nodeId) {
         const node = getNodeDataById(nodeId);
         if (!node) return;
@@ -889,6 +967,8 @@
         document.getElementById("edit-name").value = node.name || "";
         document.getElementById("edit-text").value = node.name || "";
         document.getElementById("edit-ip").value = node.ip || "";
+        document.getElementById("edit-port-service").value = "web";
+        syncPortValueFromService(node);
         document.getElementById("modal-title").textContent = "Edit node";
         document.getElementById("delete-confirm").style.display = "none";
         setModeUI("edit");
@@ -908,6 +988,8 @@
         populateSelect(floorSelect, lastArgs.floor_options || [], node.floor || "");
         document.getElementById("edit-name").value = node.name || "";
         document.getElementById("edit-ip").value = node.ip || "";
+        document.getElementById("edit-port-service").value = "web";
+        syncPortValueFromService(node);
         document.getElementById("modal-title").textContent = "Delete node";
         document.getElementById("delete-confirm").style.display = "block";
         setModeUI("delete");
@@ -933,6 +1015,8 @@
         document.getElementById("edit-name").value = defaultName;
         document.getElementById("edit-text").value = "";
         document.getElementById("edit-ip").value = "";
+        document.getElementById("edit-port-service").value = "web";
+        document.getElementById("edit-port-value").value = "";
         document.getElementById("modal-title").textContent = "Create node";
         document.getElementById("delete-confirm").style.display = "none";
         setModeUI("create");
@@ -944,6 +1028,11 @@
       }
 
       document.getElementById("edit-type").addEventListener("change", updateFieldVisibility);
+      document.getElementById("edit-port-service").addEventListener("change", () => {
+        if (!editState.nodeId) return;
+        const node = getNodeDataById(editState.nodeId);
+        syncPortValueFromService(node);
+      });
       document.getElementById("modal-close").addEventListener("click", () => {
         setOverlayOpen(false);
         editState.nodeId = null;
@@ -963,6 +1052,8 @@
           node_type: nodeType,
           name: getNameValue(),
           ip: nodeType === "domain" || nodeType === "text" ? "" : document.getElementById("edit-ip").value,
+          port_service: document.getElementById("edit-port-service").value,
+          port_value: document.getElementById("edit-port-value").value,
           floor: document.getElementById("edit-floor").value,
         };
         setOverlayOpen(false);
@@ -978,6 +1069,8 @@
           node_type: nodeType,
           name: getNameValue(),
           ip: nodeType === "domain" || nodeType === "text" ? "" : document.getElementById("edit-ip").value,
+          port_service: document.getElementById("edit-port-service").value,
+          port_value: document.getElementById("edit-port-value").value,
           floor: document.getElementById("edit-floor").value,
           position: editState.position,
         };
