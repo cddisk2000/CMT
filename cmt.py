@@ -34,11 +34,6 @@ SMART_MOD = load_module(
     os.path.join(BASE_DIR, "Cisco_General", "Cisco_Smart_health_check.py")
 )
 
-ZABBIX_MOD = load_module(
-    "Zabbix_Map",
-    os.path.join(BASE_DIR, "Network Architecture Diagram", "zabbix_map.py")
-)
-
 # ===== Streamlit page config (ONLY here) =====
 st.set_page_config(
     page_title="Cisco Maintain Tools",
@@ -249,22 +244,6 @@ def page_home():
             st.session_state["page"] = "cisco_smart_health"
             st.rerun()
 
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        st.markdown(
-            """
-            <div class="card">
-                <h3>Network Architecture Diagram</h3>
-                <div class="meta">Zabbix MAP style topology</div>
-                <p>Interactive map with ping status, alerts, and grouping.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("Open Network Architecture Diagram", use_container_width=True):
-            st.session_state["page"] = "zabbix_map"
-            st.rerun()
-
 def router():
     apply_theme()
     st.sidebar.markdown('<div class="sidebar-title">Cisco Maintain Tools</div>', unsafe_allow_html=True)
@@ -275,12 +254,11 @@ def router():
         "ie_optical_fiber": 1,
         "cisco_general": 2,
         "cisco_smart_health": 3,
-        "zabbix_map": 4,
     }
 
     menu = st.sidebar.radio(
         "Menu",
-        ["Home", "IE Optical Fiber Health", "Cisco General", "Cisco Smart Health Check", "Network Architecture Diagram"],
+        ["Home", "IE Optical Fiber Health", "Cisco General", "Cisco Smart Health Check"],
         index=index_map.get(page_key, 0),
     )
 
@@ -311,14 +289,6 @@ def router():
             st.error("Cisco_General/Cisco_Smart_health_check.py does not provide: def run():")
             return
         SMART_MOD.run()
-        return
-
-    if menu == "Network Architecture Diagram":
-        st.session_state["page"] = "zabbix_map"
-        if not hasattr(ZABBIX_MOD, "run"):
-            st.error("Network Architecture Diagram/zabbix_map.py does not provide: def run():")
-            return
-        ZABBIX_MOD.run()
         return
 
 if "page" not in st.session_state:

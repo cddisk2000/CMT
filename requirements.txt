@@ -1,0 +1,8 @@
+streamlit
+pandas
+netmiko
+requests
+ping3
+asyncssh
+websockets
+streamlit-autorefresh
