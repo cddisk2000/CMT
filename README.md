@@ -20,14 +20,6 @@
 #=== Cisco General ====
 <img width="961" height="532" alt="image" src="https://github.com/user-attachments/assets/36671007-9492-4f14-8221-160a6d7c8269" />
 
-#=== Network Architecture Diagram ===
-<img width="728" height="415" alt="image" src="https://github.com/user-attachments/assets/a2aefb5c-f065-4bd9-8999-885e244dfa7c" />
-
-#=== Version Update ==
-<br> Added Network Architecture Diagram (Alerts, Ping) <br>
-<br> Optimize button interface <br>
-
-
 
 <br> Thanks to AI tools, even seemingly insignificant small operations and maintenance tools can make my grand dream come true. <br>
 
